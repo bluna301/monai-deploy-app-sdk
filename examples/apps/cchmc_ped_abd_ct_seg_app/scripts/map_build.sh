@@ -26,5 +26,12 @@ cuda_version=$4
 # load in environment variables
 source .env
 
-# build MAP - let pacakger choose base image
-monai-deploy package ../cchmc_ped_abd_ct_seg_app -m $HOLOSCAN_MODEL_PATH -c ../cchmc_ped_abd_ct_seg_app/app.yaml -t ${tag_prefix}:${image_version} --platform x86_64 --sdk-version ${monai_deploy_app_sdk_version} --cuda ${cuda_version} -l DEBUG
+# build MAP - let packager choose base image
+monai-deploy package "../cchmc_ped_abd_ct_seg_app" \
+    -m "$HOLOSCAN_MODEL_PATH" \
+    -c "../cchmc_ped_abd_ct_seg_app/app.yaml" \
+    -t "${tag_prefix}:${image_version}" \
+    --platform x86_64 \
+    --sdk-version "${monai_deploy_app_sdk_version}" \
+    --cuda "${cuda_version}" \
+    -l DEBUG

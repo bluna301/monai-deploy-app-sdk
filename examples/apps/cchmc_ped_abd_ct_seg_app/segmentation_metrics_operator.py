@@ -26,8 +26,6 @@ from monai.data import MetaTensor
 from monai.deploy.core import ConditionType, Fragment, Operator, OperatorSpec
 from monai.deploy.core.domain.image import Image
 
-# from monai.utils import get_tuple_axcodes
-
 
 class SegmentationMetricsOperator(Operator):
     """This operator computes segmentation metrics for predicted segmentation masks.
@@ -249,11 +247,6 @@ class SegmentationMetricsOperator(Operator):
             seg_array = seg_array[0] if seg_array.shape[0] == 1 else seg_array  # Remove batch dimension if present
             if len(seg_array.shape) == 3:
                 is_3d = True
-            # Transpose to match scan_array shape if needed
-            if seg_array.shape != scan_array.shape and is_3d:
-                seg_array = xp.transpose(seg_array, (2, 1, 0))
-            elif seg_array.shape != scan_array.shape and not is_3d:
-                seg_array = xp.transpose(seg_array, (1, 0))
 
         if (
             self.use_gpu and has_cupy and not isinstance(seg_array, cupy.ndarray)
@@ -261,11 +254,10 @@ class SegmentationMetricsOperator(Operator):
             self._logger.info("Moving segmentation mask from CPU to GPU for processing.")
             seg_array = xp.asarray(seg_array)
 
-        # Ensure scan and segmentation have same shape
         if seg_array.shape != scan_array.shape:
-            self._logger.warning(
-                f"Segmentation shape {seg_array.shape} doesn't match scan shape {scan_array.shape}. "
-                "Attempting to proceed but results may be incorrect."
+            raise ValueError(
+                f"Segmentation shape {seg_array.shape} does not match scan shape {scan_array.shape}. "
+                "Inputs must already be spatially aligned before metric computation."
             )
 
         # Print mean, max min for scan_array for debugging
@@ -398,7 +390,8 @@ def test():
     print("=" * 60)
 
     # Create synthetic data: 100x100x100 volume for better timing comparison
-    scan_data = np.random.rand(100, 100, 100) * 100  # Random intensities 0-100
+    rng = np.random.default_rng()
+    scan_data = rng.random((100, 100, 100)) * 100  # Random intensities 0-100
     seg_data = np.zeros((100, 100, 100), dtype=np.int32)
 
     # Create multiple labeled regions with various sizes
@@ -439,7 +432,7 @@ def test():
     # Test: Operator compute() with CPU
     print("\n[Test] Running SegmentationMetricsOperator.compute() with CPU...")
     fragment = Fragment()
-    operator = SegmentationMetricsOperator(fragment, use_gpu=False)
+    operator = SegmentationMetricsOperator(fragment, use_gpu=False, labels_dict=label_dict)
     op_input = MockOpInput(seg_image, scan_image)
     op_output = MockOpOutput()
     operator.compute(op_input, op_output, context=None)

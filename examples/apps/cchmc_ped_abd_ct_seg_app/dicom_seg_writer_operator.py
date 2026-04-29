@@ -23,13 +23,16 @@ from monai.deploy.utils.importutil import optional_import
 from monai.deploy.utils.version import get_sdk_semver
 
 dcmread, _ = optional_import("pydicom", name="dcmread")
-generate_uid, _ = optional_import("pydicom.uid", name="generate_uid")
-ImplicitVRLittleEndian, _ = optional_import("pydicom.uid", name="ImplicitVRLittleEndian")
-ExplicitVRLittleEndian, _ = optional_import("pydicom.uid", name="ExplicitVRLittleEndian")
-Dataset, _ = optional_import("pydicom.dataset", name="Dataset")
-FileDataset, _ = optional_import("pydicom.dataset", name="FileDataset")
-DA, _ = optional_import("pydicom.valuerep", name="DA")
-TM, _ = optional_import("pydicom.valuerep", name="TM")
+_PYDICOM_UID = "pydicom.uid"
+_PYDICOM_DATASET = "pydicom.dataset"
+_PYDICOM_VALUEREP = "pydicom.valuerep"
+generate_uid, _ = optional_import(_PYDICOM_UID, name="generate_uid")
+ImplicitVRLittleEndian, _ = optional_import(_PYDICOM_UID, name="ImplicitVRLittleEndian")
+ExplicitVRLittleEndian, _ = optional_import(_PYDICOM_UID, name="ExplicitVRLittleEndian")
+Dataset, _ = optional_import(_PYDICOM_DATASET, name="Dataset")
+FileDataset, _ = optional_import(_PYDICOM_DATASET, name="FileDataset")
+DA, _ = optional_import(_PYDICOM_VALUEREP, name="DA")
+TM, _ = optional_import(_PYDICOM_VALUEREP, name="TM")
 PyDicomSequence, _ = optional_import("pydicom.sequence", name="Sequence")
 sitk, _ = optional_import("SimpleITK")
 codes, _ = optional_import("pydicom.sr.codedict", name="codes")

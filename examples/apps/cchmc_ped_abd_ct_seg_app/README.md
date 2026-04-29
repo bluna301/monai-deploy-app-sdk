@@ -43,7 +43,7 @@ The application executes the following processing DAG:
 | DICOM SC | `output/SC/` | Organ contour overlay images |
 | DICOM Encapsulated PDF | `output/PDF/` | Z-score quantile curve report |
 
-Output visibility is controlled by the `labels_dict` parameters in `app.py`. By default, the model segments Liver (1), Spleen (2), and Pancreas (3); SEG and SC outputs have all organs, but only Liver and Spleen are included in the SR and and Encapsulated PDF outputs.
+Output visibility is controlled by the `labels_dict` parameters in `app.py`. By default, the model segments Liver (1), Spleen (2), and Pancreas (3); SEG and SC outputs have all organs, but only Liver and Spleen are included in the SR and Encapsulated PDF outputs.
 
 ## Z-Score Analysis
 
@@ -116,7 +116,7 @@ To add normative data for a new organ or metric:
 Series selection criteria are defined in JSON within `app.py` and evaluated by `DICOMSeriesSelectorOperator`. The default rules select **Standard Axial CT** series meeting all of the following:
 
 - **Modality:** `CT` (case-insensitive)
-- **ImageOrientationPatient:** Axial orientation (determined programmtically)
+- **ImageOrientationPatient:** Axial orientation (determined programmatically)
 - **ImageType:** contains `PRIMARY` (excludes secondary and reformatted series)
 - **SliceThickness:** between 2.0 and 5.0 mm (inclusive)
 - **SeriesDescription:** does not contain `cor`, `sag`, or `lung` (case-insensitive)

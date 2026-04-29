@@ -11,6 +11,7 @@
 
 import logging
 import os
+import tempfile
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -106,7 +107,15 @@ class SegmentationZScoreOperator(Operator):
 
         # Receive inputs
         metrics_dict = op_input.receive(self.input_name_metrics)
-        study_selected_series_list = op_input.receive(self.input_name_dcm_series)
+
+        study_selected_series_list = None
+        try:
+            study_selected_series_list = op_input.receive(self.input_name_dcm_series)
+        except Exception:
+            pass
+
+        if not study_selected_series_list:
+            raise ValueError("study_selected_series_list is required for patient demographics (PatientAge, PatientSex)")
 
         # Extract patient demographics from DICOM series
         dicom_series = None
@@ -123,10 +132,18 @@ class SegmentationZScoreOperator(Operator):
         patient_sex = orig_ds.get("PatientSex", "")
         patient_age_str = orig_ds.get("PatientAge", "")
 
-        # Convert DICOM age string (e.g., "012Y") to numeric value
-        if patient_age_str and patient_age_str.endswith("Y"):
-            patient_age = float(patient_age_str[:-1])
-        else:
+        # Convert DICOM age string (e.g., "012Y", "006M", "003W", "010D") to years
+        patient_age = None
+        if len(patient_age_str) == 4 and patient_age_str[:3].isdigit():
+            age_value = float(patient_age_str[:3])
+            age_unit = patient_age_str[3].upper()
+            patient_age = {
+                "Y": age_value,
+                "M": age_value / 12.0,
+                "W": age_value / 52.1429,
+                "D": age_value / 365.25,
+            }.get(age_unit)
+        if patient_age is None:
             raise ValueError(f"Invalid or missing PatientAge: {patient_age_str}")
 
         self._logger.info(f"Extracted PatientSex: {patient_sex}, PatientAge: {patient_age}")
@@ -137,9 +154,6 @@ class SegmentationZScoreOperator(Operator):
         # Validate inputs
         if metrics_dict is None or not isinstance(metrics_dict, dict):
             raise ValueError("metrics_dict must be a dictionary from SegmentationMetricsOperator")
-
-        if patient_age is None or not isinstance(patient_age, (int, float)):
-            raise ValueError("patient_age must be a numeric value")
 
         # If patient_sex is m or f, convert to full string
         if patient_sex.lower() == "m":
@@ -263,7 +277,7 @@ class SegmentationZScoreOperator(Operator):
             biomarker_quantiles.append(biomarker_val)
 
         # Pair quantiles with their corresponding biomarker values
-        quantile_biomarker = list(zip(quantiles, biomarker_quantiles))
+        quantile_biomarker = zip(quantiles, biomarker_quantiles)
 
         # Sort by biomarker values to ensure proper ordering
         quantile_biomarker_sorted = sorted(quantile_biomarker, key=lambda x: x[1])
@@ -356,13 +370,21 @@ class SegmentationZScoreOperator(Operator):
                 or metrics.get("biomarker_value")
             )
 
-            units_dict[sr_name] = (
-                "mL"
-                if ("volume_ml" in metrics or "volume" in metrics)
-                else "cm²" if ("area_cm2" in metrics or "area" in metrics) else ""
-            )
+            if "volume_ml" in metrics or "volume" in metrics:
+                units_dict[sr_name] = "mL"
+            elif "area_cm2" in metrics or "area" in metrics:
+                units_dict[sr_name] = "cm²"
+            else:
+                units_dict[sr_name] = ""
 
-            if biomarker_value is None or biomarker_value == 0:
+            # Detect absent segmentation via presence fields rather than the biomarker value itself,
+            # so that a legitimate 0.0 derived metric (e.g. from additional_metrics_map) is not
+            # silently discarded as "no segmentation".
+            no_segmentation = (
+                metrics.get("pixel.count", metrics.get("pixel_count")) == 0
+                or metrics.get("num.slices", metrics.get("num_slices")) == 0
+            )
+            if biomarker_value is None or no_segmentation:
                 self._logger.warning(f"No valid biomarker value for organ {organ_name!r}, skipping")
                 zscore_dict[sr_name] = {
                     "percentile": None,
@@ -516,7 +538,7 @@ class SegmentationZScoreOperator(Operator):
                 (patient_age, biomarker_value),
                 xytext=(10, 10),
                 textcoords="offset points",
-                bbox=dict(boxstyle="round,pad=0.5", facecolor="yellow", alpha=0.7),
+                bbox={"boxstyle": "round,pad=0.5", "facecolor": "yellow", "alpha": 0.7},
                 fontsize=9,
                 fontweight="bold",
             )
@@ -641,8 +663,7 @@ def test():
             print(f"PDF generated successfully: {len(pdf_bytes)} bytes")
 
             # Optionally save for testing
-            test_output_path = Path("/tmp/pdfs_test")
-            test_output_path.mkdir(parents=True, exist_ok=True)
+            test_output_path = Path(tempfile.mkdtemp())
             test_pdf_file = test_output_path / "zscore_report_test.pdf"
             with open(test_pdf_file, "wb") as f:
                 f.write(pdf_bytes)

@@ -25,11 +25,13 @@ from monai.deploy.utils.version import get_sdk_semver
 
 dcmread, _ = optional_import("pydicom", name="dcmread")
 dcmwrite, _ = optional_import("pydicom.filewriter", name="dcmwrite")
-generate_uid, _ = optional_import("pydicom.uid", name="generate_uid")
-ImplicitVRLittleEndian, _ = optional_import("pydicom.uid", name="ImplicitVRLittleEndian")
-ExplicitVRLittleEndian, _ = optional_import("pydicom.uid", name="ExplicitVRLittleEndian")
-Dataset, _ = optional_import("pydicom.dataset", name="Dataset")
-FileDataset, _ = optional_import("pydicom.dataset", name="FileDataset")
+_PYDICOM_UID = "pydicom.uid"
+_PYDICOM_DATASET = "pydicom.dataset"
+generate_uid, _ = optional_import(_PYDICOM_UID, name="generate_uid")
+ImplicitVRLittleEndian, _ = optional_import(_PYDICOM_UID, name="ImplicitVRLittleEndian")
+ExplicitVRLittleEndian, _ = optional_import(_PYDICOM_UID, name="ExplicitVRLittleEndian")
+Dataset, _ = optional_import(_PYDICOM_DATASET, name="Dataset")
+FileDataset, _ = optional_import(_PYDICOM_DATASET, name="FileDataset")
 Sequence, _ = optional_import("pydicom.sequence", name="Sequence")
 
 
@@ -211,27 +213,26 @@ class DICOMSCWriterOperator(Operator):
         else:
             raise ValueError(f"Unsupported overlay_image type: {type(overlay_image)}")
 
-        # Handle 3D RGB image (multi-frame)
-        # Expected formats:
-        #   (Slices, Channels, Height, Width)
-        #   (Slices, Height, Width, Channels)
-        #   (Channels, Slices, Height, Width)
+        # Normalize to (Slices, Height, Width, 3) for multi-frame or (Height, Width, 3) for single-frame.
+        # Priority: trailing-channel first, then channel-in-axis-1, then channel-in-axis-0.
         if image_numpy.ndim == 4:
-            # Handle (Channels, Slices, Height, Width) -> (Slices, Channels, Height, Width)
-            if image_numpy.shape[0] == 3:
-                image_numpy = np.transpose(image_numpy, (1, 0, 2, 3))
-            # Check if channels are in position 1 or 3
-            if image_numpy.shape[1] == 3:
-                # Format: (Slices, 3, Height, Width) -> (Slices, Height, Width, 3)
-                image_numpy = np.transpose(image_numpy, (0, 2, 3, 1))
-            elif image_numpy.shape[3] != 3:
-                raise ValueError(f"Expected 3 channels for RGB, got shape: {image_numpy.shape}")
+            if image_numpy.shape[-1] == 3:
+                pass  # (Slices, Height, Width, 3)
+            elif image_numpy.shape[1] == 3:
+                image_numpy = np.transpose(image_numpy, (0, 2, 3, 1))  # (Slices, 3, Height, Width)
+            elif image_numpy.shape[0] == 3:
+                image_numpy = np.transpose(image_numpy, (1, 2, 3, 0))  # (3, Slices, Height, Width)
+            else:
+                raise ValueError(f"Expected RGB data, got shape: {image_numpy.shape}")
             # Now in format: (Slices, Height, Width, 3)
             num_frames, rows, cols, samples_per_pixel = image_numpy.shape
         elif image_numpy.ndim == 3:
-            # Single frame: (3, Height, Width) or (Height, Width, 3)
-            if image_numpy.shape[0] == 3:
-                image_numpy = np.transpose(image_numpy, (1, 2, 0))
+            if image_numpy.shape[-1] == 3:
+                pass  # (Height, Width, 3)
+            elif image_numpy.shape[0] == 3:
+                image_numpy = np.transpose(image_numpy, (1, 2, 0))  # (3, Height, Width)
+            else:
+                raise ValueError(f"Expected single-frame RGB data, got shape: {image_numpy.shape}")
             rows, cols, samples_per_pixel = image_numpy.shape
             num_frames = 1
             # Add frame dimension: (Height, Width, 3) -> (1, Height, Width, 3)
@@ -366,7 +367,8 @@ def test():
     # 1. Generate Synthetic RGB Image (Slices, Channels, H, W) -> (2, 3, 256, 256)
     # This simulates a 2-frame RGB overlay
     print("Generating synthetic RGB image...")
-    dummy_image = np.random.randint(0, 255, size=(2, 3, 256, 256), dtype=np.uint8)
+    rng = np.random.default_rng()
+    dummy_image = rng.integers(0, 255, size=(2, 3, 256, 256), dtype=np.uint8)
 
     # 2. Setup Operators
     fragment = Fragment()

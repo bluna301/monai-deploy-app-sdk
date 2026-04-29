@@ -12,9 +12,9 @@
 import logging
 from typing import Any, List, Union
 
+import matplotlib
 import numpy as np
 import torch
-from matplotlib import cm
 
 from monai.deploy.utils.importutil import optional_import
 
@@ -92,9 +92,9 @@ class SegmentationOverlayOperator(Operator):
         self.output_name_overlay = "overlay"
         self.use_gpu = use_gpu and has_cupy
         self.alpha = alpha
-        self.default_window_center = SegmentationOverlayOperator.DEFAULT_WINDOW_CENTER
-        self.default_window_width = SegmentationOverlayOperator.DEFAULT_WINDOW_WIDTH
-        self.default_voi_lut_function = SegmentationOverlayOperator.DEFAULT_VOI_LUT_FUNCTION
+        self.window_center_default = SegmentationOverlayOperator.DEFAULT_WINDOW_CENTER
+        self.window_width_default = SegmentationOverlayOperator.DEFAULT_WINDOW_WIDTH
+        self.voi_lut_function_default = SegmentationOverlayOperator.DEFAULT_VOI_LUT_FUNCTION
 
         # Need to call the base class constructor last
         super().__init__(fragment, *args, **kwargs)
@@ -127,9 +127,9 @@ class SegmentationOverlayOperator(Operator):
         # used when tags are absent; non-CT modalities fall back to auto-windowing.
         window_center, window_width, voi_lut_function = self._extract_dicom_window(
             study_selected_series_list,
-            default_window_center=self.default_window_center,
-            default_window_width=self.default_window_width,
-            default_voi_lut_function=self.default_voi_lut_function,
+            default_window_center=self.window_center_default,
+            default_window_width=self.window_width_default,
+            default_voi_lut_function=self.voi_lut_function_default,
         )
 
         # create overlay
@@ -638,7 +638,7 @@ class SegmentationOverlayOperator(Operator):
         label_uint8 = label_normalized.astype(np.uint8)
 
         # Apply Jet colormap
-        jet_colormap = cm.get_cmap("jet", 256)
+        jet_colormap = matplotlib.colormaps["jet"].resampled(256)
         label_rgb = np.asarray(jet_colormap(label_uint8))[:, :, :, :3]  # Take only RGB channels
 
         # Convert to uint8 and rearrange to (3, D, H, W)
@@ -691,7 +691,7 @@ class SegmentationOverlayOperator(Operator):
                 slice_axis = match_axes[0]
             else:
                 slice_axis = int(np.argmin(img.shape))
-            self._logger.debug(f"Per-slice window: {n_win} windows, img shape {img.shape}, " f"slice_axis={slice_axis}")
+            self._logger.debug(f"Per-slice window: {n_win} windows, img shape {img.shape}, slice_axis={slice_axis}")
 
             wc = window_center.astype(np.float64)
             ww = np.asarray(window_width).astype(np.float64)
@@ -783,7 +783,7 @@ class SegmentationOverlayOperator(Operator):
                 slice_axis = match_axes[0]
             else:
                 slice_axis = int(np.argmin(img.shape))
-            self._logger.debug(f"Per-slice window: {n_win} windows, img shape {img.shape}, " f"slice_axis={slice_axis}")
+            self._logger.debug(f"Per-slice window: {n_win} windows, img shape {img.shape}, slice_axis={slice_axis}")
 
             wc = window_center.astype(np.float64)
             ww = np.asarray(window_width).astype(np.float64)
@@ -846,7 +846,8 @@ def test():
     print("=" * 60)
 
     # Create synthetic data: 100x100x100 volume for better timing comparison
-    scan_data = np.random.rand(100, 100, 100) * 100  # Random intensities 0-100
+    rng = np.random.default_rng()
+    scan_data = rng.random((100, 100, 100)) * 100  # Random intensities 0-100
     seg_data = np.zeros((100, 100, 100), dtype=np.int32)
 
     # Create multiple labeled regions with various sizes
@@ -875,7 +876,7 @@ def test():
     operator_cpu = SegmentationMetricsOperator(fragment1, use_gpu=False)
 
     start_time = time.time()
-    metrics_cpu = operator_cpu.calculate_metrics(seg_image, scan_image, label_dict)
+    # metrics_cpu = operator_cpu.calculate_metrics(seg_image, scan_image, label_dict)
     cpu_time = time.time() - start_time
 
     print(f"CPU Time: {cpu_time:.4f} seconds")
@@ -934,7 +935,7 @@ def test():
         operator_gpu_fast = SegmentationMetricsOperator(fragment3, use_gpu=True, compute_components=False)
 
         start_time = time.time()
-        metrics_gpu_fast = operator_gpu_fast.calculate_metrics(seg_image_gpu, scan_image_gpu, label_dict)
+        # metrics_gpu_fast = operator_gpu_fast.calculate_metrics(seg_image_gpu, scan_image_gpu, label_dict)
         gpu_fast_time = time.time() - start_time
 
         print(f"GPU Compute Time (no components): {gpu_fast_time:.4f} seconds")

@@ -91,11 +91,12 @@ class SegmentationContourOperator(Operator):
         """
 
         label_image = copy.deepcopy(segmentation_mask)
-        metadata = (
-            segmentation_mask.meta
-            if isinstance(segmentation_mask, MetaTensor)
-            else segmentation_mask.metadata() if isinstance(segmentation_mask, Image) else None
-        )
+        if isinstance(segmentation_mask, MetaTensor):
+            metadata = segmentation_mask.meta
+        elif isinstance(segmentation_mask, Image):
+            metadata = segmentation_mask.metadata()
+        else:
+            metadata = None
 
         self._logger.info(f"Segmentation_mask is of type: {type(segmentation_mask)}")
 
@@ -117,7 +118,7 @@ class SegmentationContourOperator(Operator):
             _meta = label_image  # retain MetaTensor reference for fallback
             try:
                 label_image = xp.asarray(_meta)  # Direct conversion to cupy array if possible
-            except Exception as e:
+            except Exception:
                 label_image = _meta.cpu().numpy()  # Fallback to CPU numpy array - if MetaTensor is on CPU
 
         # Does not apply - using numpy for now

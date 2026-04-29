@@ -42,6 +42,7 @@ from monai.deploy.core import Application
 from monai.deploy.operators.dicom_data_loader_operator import DICOMDataLoaderOperator
 from monai.deploy.operators.dicom_encapsulated_pdf_writer_operator import DICOMEncapsulatedPDFWriterOperator
 from monai.deploy.operators.dicom_series_to_volume_operator import DICOMSeriesToVolumeOperator
+from monai.deploy.utils.version import get_sdk_semver
 
 
 # inherit new Application class instance, AIAbdomenSegApp, from MONAI Application base class
@@ -163,7 +164,7 @@ class AIAbdomenSegApp(Application):
         my_equipment_info = EquipmentInfo(
             manufacturer="The MONAI Consortium",
             manufacturer_model="MONAI Deploy App SDK",
-            software_version_number="3.5.0",  # MONAI Deploy App SDK version
+            software_version_number=get_sdk_semver(),
         )
 
         # custom tags - add AlgorithmName for monitoring purposes

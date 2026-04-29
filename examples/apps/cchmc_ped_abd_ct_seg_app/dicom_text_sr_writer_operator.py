@@ -17,12 +17,16 @@ from monai.deploy.utils.importutil import optional_import
 
 dcmread, _ = optional_import("pydicom", name="dcmread")
 dcmwrite, _ = optional_import("pydicom.filewriter", name="dcmwrite")
-generate_uid, _ = optional_import("pydicom.uid", name="generate_uid")
-ImplicitVRLittleEndian, _ = optional_import("pydicom.uid", name="ImplicitVRLittleEndian")
-ExplicitVRLittleEndian, _ = optional_import("pydicom.uid", name="ExplicitVRLittleEndian")
-Dataset, _ = optional_import("pydicom.dataset", name="Dataset")
-FileDataset, _ = optional_import("pydicom.dataset", name="FileDataset")
+_PYDICOM_UID = "pydicom.uid"
+_PYDICOM_DATASET = "pydicom.dataset"
+generate_uid, _ = optional_import(_PYDICOM_UID, name="generate_uid")
+ImplicitVRLittleEndian, _ = optional_import(_PYDICOM_UID, name="ImplicitVRLittleEndian")
+ExplicitVRLittleEndian, _ = optional_import(_PYDICOM_UID, name="ExplicitVRLittleEndian")
+Dataset, _ = optional_import(_PYDICOM_DATASET, name="Dataset")
+FileDataset, _ = optional_import(_PYDICOM_DATASET, name="FileDataset")
 Sequence, _ = optional_import("pydicom.sequence", name="Sequence")
+
+_CODE_MEANING_AREA = "square centimeters"
 
 from monai.deploy.core import ConditionType, Fragment, Operator, OperatorSpec
 from monai.deploy.core.domain.dicom_series import DICOMSeries
@@ -264,7 +268,7 @@ class DICOMTextSRWriterOperator(Operator):
                     code_meaning = "milliliter"
                 elif metric_name_lower == "area":
                     unit = "cm2"
-                    code_meaning = "square centimeters"
+                    code_meaning = _CODE_MEANING_AREA
                 elif "intensity" in metric_name_lower and is_ct_source:
                     unit = "HU"
                     code_meaning = "Hounsfield Unit"
@@ -308,7 +312,7 @@ class DICOMTextSRWriterOperator(Operator):
             elif unit and unit.lower() in ["ml", "milliliter", "milliliters"]:
                 code_meaning = "milliliter"
             elif unit and unit.lower() in ["cm2", "cm^2", "square centimeters"]:
-                code_meaning = "square centimeters"
+                code_meaning = _CODE_MEANING_AREA
             else:
                 code_meaning = unit or ""
 
@@ -388,9 +392,6 @@ class DICOMTextSRWriterOperator(Operator):
         if not result_text:
             raise IOError("Input is read but blank.")
 
-        # Prepare content sequences elements (delegated to helper)
-        content_sequence_elements = self._create_content_sequence(result_text)
-
         study_selected_series_list = None
         try:
             study_selected_series_list = op_input.receive(self.input_name_dcm_series)
@@ -408,9 +409,15 @@ class DICOMTextSRWriterOperator(Operator):
                 for selected_series in study_selected_series.selected_series:
                     dicom_series = selected_series.series
                     break
+                if dicom_series is not None:
+                    break
 
         source_modality = self._get_source_modality(dicom_series)
         self._logger.info(f"Detected source modality for DICOM SR content: {source_modality}")
+
+        # Prepare content sequence elements after source_modality is known so that
+        # modality-aware normalization (e.g. HU units for CT intensity metrics) applies.
+        content_sequence_elements = self._create_content_sequence(result_text, source_modality)
         self.output_folder.mkdir(parents=True, exist_ok=True)
 
         # Now ready to starting writing the DICOM instance
