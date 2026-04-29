@@ -833,7 +833,7 @@ class SegmentationOverlayOperator(Operator):
 
 
 def test():
-    """Test function for the SegmentationMetricsOperator."""
+    """Test function for the SegmentationOverlayOperator."""
     import time
 
     import numpy as np
@@ -841,116 +841,103 @@ def test():
     from monai.deploy.core import Fragment
     from monai.deploy.core.domain.image import Image
 
-    # Create a larger 3D test case for timing comparison
-    print("Testing SegmentationMetricsOperator...")
+    print("Testing SegmentationOverlayOperator...")
     print("=" * 60)
 
-    # Create synthetic data: 100x100x100 volume for better timing comparison
-    rng = np.random.default_rng()
-    scan_data = rng.random((100, 100, 100)) * 100  # Random intensities 0-100
+    # Create synthetic data: 100x100x100 volume
+    rng = np.random.default_rng(42)
+    scan_data = rng.random((100, 100, 100)) * 100  # Random intensities 0-100 (HU-like)
     seg_data = np.zeros((100, 100, 100), dtype=np.int32)
 
-    # Create multiple labeled regions with various sizes
+    # Create labeled regions
     seg_data[20:50, 20:80, 20:80] = 1  # Label 1: liver (large region)
     seg_data[60:90, 30:70, 30:70] = 2  # Label 2: spleen (medium region)
     seg_data[10:15, 10:15, 10:15] = 3  # Label 3: kidney (small region)
 
-    # Add some fragmentation to test connected components
-    seg_data[25:28, 25:28, 25:28] = 2  # Small isolated spleen fragment
-    seg_data[85:88, 85:88, 85:88] = 2  # Another small spleen fragment
-
-    # Create Image objects with spacing metadata
-    scan_image = Image(scan_data, metadata={"spacing": [1.0, 1.0, 1.0]})  # 1mm spacing (mL = mm³/1000)
+    scan_image = Image(scan_data, metadata={"spacing": [1.0, 1.0, 1.0]})
     seg_image = Image(seg_data)
 
-    # Define label dictionary
-    label_dict = {
-        "liver": 1,
-        "spleen": 2,
-        "kidney": 3,
-    }
-
-    # Test 1: Without GPU (CPU only)
-    print("\n[Test 1] Running with CPU (use_gpu=False)...")
+    # Test 1: CPU path with scalar window (CT soft-tissue defaults)
+    print("\n[Test 1] Running create_overlay() with CPU, scalar window...")
     fragment1 = Fragment()
-    operator_cpu = SegmentationMetricsOperator(fragment1, use_gpu=False)
-
+    operator_cpu = SegmentationOverlayOperator(fragment1, use_gpu=False, alpha=0.7)
     start_time = time.time()
-    # metrics_cpu = operator_cpu.calculate_metrics(seg_image, scan_image, label_dict)
+    overlay_cpu = operator_cpu.create_overlay(
+        seg_image,
+        scan_image,
+        window_center=40.0,
+        window_width=400.0,
+        voi_lut_function="LINEAR",
+    )
     cpu_time = time.time() - start_time
-
     print(f"CPU Time: {cpu_time:.4f} seconds")
+    overlay_arr = overlay_cpu.asnumpy() if isinstance(overlay_cpu, Image) else np.asarray(overlay_cpu)
+    print(f"Output shape: {overlay_arr.shape}, dtype: {overlay_arr.dtype}")
+    assert overlay_arr.ndim == 4 and overlay_arr.shape[0] == 3, f"Expected (3, D, H, W), got {overlay_arr.shape}"
 
-    # Test 2: With GPU (if available) - data already on GPU
-    print("\n[Test 2] Running with GPU (data already on GPU, with components)...")
+    # Test 2: CPU path with LINEAR_EXACT
+    print("\n[Test 2] Running create_overlay() with CPU, LINEAR_EXACT window...")
+    overlay_le = operator_cpu.create_overlay(
+        seg_image,
+        scan_image,
+        window_center=50.0,
+        window_width=200.0,
+        voi_lut_function="LINEAR_EXACT",
+    )
+    arr_le = overlay_le.asnumpy() if isinstance(overlay_le, Image) else np.asarray(overlay_le)
+    assert arr_le.shape == overlay_arr.shape, "LINEAR_EXACT output shape mismatch"
+    print(f"Output shape: {arr_le.shape} — OK")
+
+    # Test 3: CPU path with SIGMOID
+    print("\n[Test 3] Running create_overlay() with CPU, SIGMOID window...")
+    overlay_sig = operator_cpu.create_overlay(
+        seg_image,
+        scan_image,
+        window_center=50.0,
+        window_width=400.0,
+        voi_lut_function="SIGMOID",
+    )
+    arr_sig = overlay_sig.asnumpy() if isinstance(overlay_sig, Image) else np.asarray(overlay_sig)
+    assert arr_sig.shape == overlay_arr.shape, "SIGMOID output shape mismatch"
+    print(f"Output shape: {arr_sig.shape} — OK")
+
+    # Test 4: CPU path with per-slice window (MR-like)
+    print("\n[Test 4] Running create_overlay() with CPU, per-slice window (MR)...")
+    n_slices = scan_data.shape[0]
+    wc_arr = np.linspace(30.0, 50.0, n_slices)
+    ww_arr = np.full(n_slices, 300.0)
+    overlay_ps = operator_cpu.create_overlay(
+        seg_image,
+        scan_image,
+        window_center=wc_arr,
+        window_width=ww_arr,
+        voi_lut_function="LINEAR",
+    )
+    arr_ps = overlay_ps.asnumpy() if isinstance(overlay_ps, Image) else np.asarray(overlay_ps)
+    assert arr_ps.shape == overlay_arr.shape, "Per-slice output shape mismatch"
+    print(f"Output shape: {arr_ps.shape} — OK")
+
+    # Test 5: GPU path (if CuPy is available)
+    print("\n[Test 5] Running create_overlay() with GPU (if available)...")
     fragment2 = Fragment()
-    operator_gpu = SegmentationMetricsOperator(fragment2, use_gpu=True, compute_components=True)
-
-    # Check if GPU is actually available
-    if has_cupy:
-        try:
-            import cupy
-
-            print(f"CuPy detected: {cupy.__version__}")
-
-            # Transfer data to GPU BEFORE timing
-            print("Transferring data to GPU...")
-            transfer_start = time.time()
-            scan_data_gpu = cupy.asarray(scan_data)
-            seg_data_gpu = cupy.asarray(seg_data)
-            scan_image_gpu = Image(scan_data_gpu, metadata={"spacing": [1.0, 1.0, 1.0]})
-            seg_image_gpu = Image(seg_data_gpu)
-            transfer_time = time.time() - transfer_start
-            print(f"Transfer Time: {transfer_time:.4f} seconds")
-
-            gpu_available = True
-        except Exception as e:
-            print(f"CuPy not available: {e}")
-            gpu_available = False
-            scan_image_gpu = scan_image
-            seg_image_gpu = seg_image
-    else:
-        print("CuPy not installed - will use CPU")
-        gpu_available = False
-        scan_image_gpu = scan_image
-        seg_image_gpu = seg_image
-
-    # Time only the computation (data already on GPU)
-    start_time = time.time()
-    metrics_gpu = operator_gpu.calculate_metrics(seg_image_gpu, scan_image_gpu, label_dict)
-    gpu_compute_time = time.time() - start_time
-
-    if gpu_available:
-        print(f"GPU Compute Time (with components): {gpu_compute_time:.4f} seconds")
-        speedup = cpu_time / gpu_compute_time
+    operator_gpu = SegmentationOverlayOperator(fragment2, use_gpu=True, alpha=0.7)
+    if operator_gpu.use_gpu:
+        start_time = time.time()
+        overlay_gpu = operator_gpu.create_overlay(
+            seg_image,
+            scan_image,
+            window_center=40.0,
+            window_width=400.0,
+            voi_lut_function="LINEAR",
+        )
+        gpu_time = time.time() - start_time
+        arr_gpu = overlay_gpu.asnumpy() if isinstance(overlay_gpu, Image) else np.asarray(overlay_gpu)
+        print(f"GPU Time: {gpu_time:.4f} seconds, Output shape: {arr_gpu.shape}")
+        assert arr_gpu.shape == overlay_arr.shape, "GPU output shape mismatch"
+        speedup = cpu_time / gpu_time if gpu_time > 0 else float("inf")
         print(f"Speedup vs CPU: {speedup:.2f}x")
     else:
-        print(f"Fallback CPU Time: {gpu_compute_time:.4f} seconds")
-        print("(No GPU available, used CPU backend)")
-
-    # Test 3: GPU without connected components (pure GPU performance)
-    if gpu_available:
-        print("\n[Test 3] Running with GPU (without connected components for max speed)...")
-        fragment3 = Fragment()
-        operator_gpu_fast = SegmentationMetricsOperator(fragment3, use_gpu=True, compute_components=False)
-
-        start_time = time.time()
-        # metrics_gpu_fast = operator_gpu_fast.calculate_metrics(seg_image_gpu, scan_image_gpu, label_dict)
-        gpu_fast_time = time.time() - start_time
-
-        print(f"GPU Compute Time (no components): {gpu_fast_time:.4f} seconds")
-        speedup_fast = cpu_time / gpu_fast_time
-        print(f"Speedup vs CPU: {speedup_fast:.2f}x")
-        print(f"GPU speedup from skipping components: {gpu_compute_time / gpu_fast_time:.2f}x")
-
-    # Display results from GPU run (or CPU fallback)
-    print("\n" + "=" * 60)
-    print("Segmentation Metrics Results:")
-    print("=" * 60)
-    for label_name, label_metrics in metrics_gpu.items():
-        print(f"\n{label_name}:")
-        for metric_name, metric_value in label_metrics.items():
-            print(f"  {metric_name}: {metric_value}")
+        print("CuPy not available — skipping GPU test")
 
     print("\n" + "=" * 60)
     print("Test completed successfully!")

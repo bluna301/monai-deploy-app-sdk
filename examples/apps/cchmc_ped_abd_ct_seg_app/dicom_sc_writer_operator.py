@@ -367,7 +367,7 @@ def test():
     # 1. Generate Synthetic RGB Image (Slices, Channels, H, W) -> (2, 3, 256, 256)
     # This simulates a 2-frame RGB overlay
     print("Generating synthetic RGB image...")
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(42)
     dummy_image = rng.integers(0, 255, size=(2, 3, 256, 256), dtype=np.uint8)
 
     # 2. Setup Operators

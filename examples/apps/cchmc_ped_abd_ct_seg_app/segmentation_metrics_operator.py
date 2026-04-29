@@ -390,7 +390,7 @@ def test():
     print("=" * 60)
 
     # Create synthetic data: 100x100x100 volume for better timing comparison
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(42)
     scan_data = rng.random((100, 100, 100)) * 100  # Random intensities 0-100
     seg_data = np.zeros((100, 100, 100), dtype=np.int32)
 
