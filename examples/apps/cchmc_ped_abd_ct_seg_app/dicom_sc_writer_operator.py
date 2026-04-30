@@ -243,10 +243,9 @@ class DICOMSCWriterOperator(Operator):
         # Ensure uint8 data type for RGB
         if image_numpy.dtype != np.uint8:
             # Normalize to 0-255 range if needed
-            if image_numpy.max() <= 1.0:
-                image_numpy = (image_numpy * 255).astype(np.uint8)
-            else:
-                image_numpy = image_numpy.astype(np.uint8)
+            if image_numpy.max() <= 1.0 and image_numpy.min() >= 0.0:
+                image_numpy = image_numpy * 255.0
+            image_numpy = np.clip(image_numpy, 0, 255).astype(np.uint8)
 
         # Set image-specific DICOM tags for RGB Secondary Capture
         ds.Rows = rows

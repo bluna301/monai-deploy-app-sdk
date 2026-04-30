@@ -302,7 +302,6 @@ class SegmentationOverlayOperator(Operator):
         # Handle different input types
         original_type = type(segmentation_mask)
         metadata = None
-        is_on_gpu = False
 
         if isinstance(segmentation_mask, Image):
             mask_data = segmentation_mask.asnumpy()
@@ -312,7 +311,6 @@ class SegmentationOverlayOperator(Operator):
             if segmentation_mask.is_cuda and self.use_gpu and has_cupy:
                 # Convert directly to CuPy without going through CPU
                 mask_data = cupy.asarray(segmentation_mask.detach())
-                is_on_gpu = True
             else:
                 # For CPU tensors, convert to numpy (will be transferred to GPU later if use_gpu=True)
                 mask_data = segmentation_mask.detach().numpy()
@@ -327,7 +325,6 @@ class SegmentationOverlayOperator(Operator):
             if scan.is_cuda and self.use_gpu and has_cupy:
                 # Convert directly to CuPy without going through CPU
                 scan_data = cupy.asarray(scan.detach())
-                is_on_gpu = True
             else:
                 # For CPU tensors, convert to numpy (will be transferred to GPU later if use_gpu=True)
                 scan_data = scan.detach().numpy()
@@ -357,9 +354,10 @@ class SegmentationOverlayOperator(Operator):
 
         if use_cupy:
             try:
-                # Transfer to GPU only if not already there
-                if not is_on_gpu:
+                # Ensure both arrays are on GPU independently
+                if not isinstance(mask_data, cupy.ndarray):
                     mask_data = cupy.asarray(mask_data)
+                if not isinstance(scan_data, cupy.ndarray):
                     scan_data = cupy.asarray(scan_data)
                 overlay_image = self._create_overlay_cupy(
                     scan_data, mask_data, window_center, window_width, voi_lut_function

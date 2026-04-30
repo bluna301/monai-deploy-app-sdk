@@ -245,6 +245,16 @@ class SegmentationMetricsOperator(Operator):
                 )  # Fallback to CPU numpy array, applies if self.use_gpu is False or CuPy not available
 
             seg_array = seg_array[0] if seg_array.shape[0] == 1 else seg_array  # Remove batch dimension if present
+            # Align orientation with scan: only transpose if shapes don't already match
+            # (e.g., MR MetaTensor in WHD order needs transpose to DHW; CT MetaTensor is already DHW)
+            if seg_array.ndim == 3 and seg_array.shape != scan_array.shape:
+                if has_cupy and isinstance(seg_array, cupy.ndarray):
+                    transposed = cupy.transpose(seg_array, (2, 1, 0))
+                else:
+                    transposed = np.transpose(seg_array, (2, 1, 0))
+                if transposed.shape == scan_array.shape:
+                    seg_array = transposed
+                    self._logger.info("Transposed segmentation array to match scan orientation (WHD -> DHW).")
             if len(seg_array.shape) == 3:
                 is_3d = True
 

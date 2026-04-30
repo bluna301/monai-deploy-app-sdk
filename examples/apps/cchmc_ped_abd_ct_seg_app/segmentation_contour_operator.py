@@ -120,6 +120,13 @@ class SegmentationContourOperator(Operator):
                 label_image = xp.asarray(_meta)  # Direct conversion to cupy array if possible
             except Exception:
                 label_image = _meta.cpu().numpy()  # Fallback to CPU numpy array - if MetaTensor is on CPU
+        elif isinstance(label_image, torch.Tensor):
+            t = label_image.detach()
+            if t.is_cuda:
+                t = t.cpu()
+            label_image = t.numpy()
+        else:
+            label_image = np.asarray(label_image)
 
         # Does not apply - using numpy for now
         # Move to GPU if cupy is available and not already a cupy array
@@ -194,8 +201,10 @@ class SegmentationContourOperator(Operator):
         if has_cupy and isinstance(out_ndarray, cupy.ndarray):
             out_ndarray = cupy.asnumpy(out_ndarray)
 
-        # Need to squeeze out the channel dim first
-        out_ndarray = np.squeeze(out_ndarray, 0)
+        # Squeeze channel dim only when present as singleton
+        if out_ndarray.ndim >= 4 and out_ndarray.shape[0] == 1:
+            out_ndarray = np.squeeze(out_ndarray, 0)
+
         # Transpose to DHW (see note in original code)
         out_ndarray = out_ndarray.T.astype(np.uint8)
         self._logger.debug(f"Output Seg image numpy array of type {type(out_ndarray)} shape: {out_ndarray.shape}")

@@ -72,7 +72,7 @@ The `assets/` folder contains the sex-stratified normative reference data used b
 
 ### Structure
 
-```
+```text
 assets/
 ├── liver/               # Liver volume normative data
 │   ├── results_m_fine.csv

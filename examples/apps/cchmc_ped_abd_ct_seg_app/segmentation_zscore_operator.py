@@ -374,6 +374,8 @@ class SegmentationZScoreOperator(Operator):
                 units_dict[sr_name] = "mL"
             elif "area_cm2" in metrics or "area" in metrics:
                 units_dict[sr_name] = "cm²"
+            elif "hu" in organ_name.lower() or "hu" in asset_name.lower():
+                units_dict[sr_name] = "HU"
             else:
                 units_dict[sr_name] = ""
 
@@ -430,6 +432,8 @@ class SegmentationZScoreOperator(Operator):
                     "biomarker_value": biomarker_value,
                     "percentile": percentile,
                     "z_score": z_score,
+                    "display_name": sr_name,
+                    "unit": units_dict.get(sr_name, ""),
                     "df_m": df_m,
                     "df_f": df_f,
                 }
@@ -545,8 +549,17 @@ class SegmentationZScoreOperator(Operator):
 
             # Styling
             ax.set_xlabel("Age (years)", fontsize=10)
-            ax.set_ylabel("Volume (mL)", fontsize=10)
-            ax.set_title(f"{organ_name}", fontsize=12, fontweight="bold")
+            unit = organ_data.get("unit", "")
+            if unit == "mL":
+                ylabel = "Volume (mL)"
+            elif unit == "cm²":
+                ylabel = "Area (cm²)"
+            elif unit:
+                ylabel = unit
+            else:
+                ylabel = "Value"
+            ax.set_ylabel(ylabel, fontsize=10)
+            ax.set_title(str(organ_data.get("display_name", organ_name)), fontsize=12, fontweight="bold")
             ax.grid(True, alpha=0.3)
 
             # Add legend outside the plot area (top center), only on the first plot
@@ -565,7 +578,7 @@ class SegmentationZScoreOperator(Operator):
 
         # Overall Title
         fig.suptitle(
-            f"Organ Volume Quantile Curves - {patient_sex} Patient, Age {patient_age:.1f} years",
+            f"Organ Quantile Curves - {patient_sex} Patient, Age {patient_age:.1f} years",
             fontsize=16,
             fontweight="bold",
             y=0.995,

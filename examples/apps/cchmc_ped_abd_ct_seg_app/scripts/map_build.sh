@@ -23,13 +23,15 @@ image_version=$2
 monai_deploy_app_sdk_version=$3
 cuda_version=$4
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # load in environment variables
-source .env
+source "${script_dir}/../.env"
 
 # build MAP - let packager choose base image
-monai-deploy package "../cchmc_ped_abd_ct_seg_app" \
+monai-deploy package "${script_dir}/.." \
     -m "$HOLOSCAN_MODEL_PATH" \
-    -c "../cchmc_ped_abd_ct_seg_app/app.yaml" \
+    -c "${script_dir}/../app.yaml" \
     -t "${tag_prefix}:${image_version}" \
     --platform x86_64 \
     --sdk-version "${monai_deploy_app_sdk_version}" \
