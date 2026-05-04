@@ -14,7 +14,14 @@ This decoder plugin for nvimgcodec <https://github.com/NVIDIA/nvImageCodec> deco
 encoded Pixel Data for the following transfer syntaxes:
     JPEGBaseline8Bit, 1.2.840.10008.1.2.4.50, JPEG Baseline (Process 1)
     JPEGLossless, 1.2.840.10008.1.2.4.57, JPEG Lossless, Non-Hierarchical (Process 14)
+        NOTE: 9 <= BitsStored <= 15 is NOT supported by nvimgcodec (nvjpeg GPU kernel silently
+        returns zeros for SOF3 streams with P in this range). BitsStored=8 is handled correctly
+        by nvimgcodec via its internal self-rejection (UINT8 output is unsupported by the lossless
+        backend, so it falls through cleanly). Frames with 9 <= BitsStored <= 15 are automatically
+        routed to the next capable decoder. See https://github.com/NVIDIA/nvImageCodec.
     JPEGLosslessSV1, 1.2.840.10008.1.2.4.70, JPEG Lossless, Non-Hierarchical, First-Order Prediction
+        NOTE: 9 <= BitsStored <= 15 is NOT supported by nvimgcodec (same limitation as above).
+        Frames with 9 <= BitsStored <= 15 are automatically routed to the next capable decoder.
     JPEG2000Lossless, 1.2.840.10008.1.2.4.90, JPEG 2000 Image Compression (Lossless Only)
     JPEG2000, 1.2.840.10008.1.2.4.91, JPEG 2000 Image Compression
     HTJ2KLossless, 1.2.840.10008.1.2.4.201, HTJ2K Image Compression (Lossless Only)
@@ -42,7 +49,7 @@ A custom decoding plugin must implement three objects within the same module:
       This will be used to provide the user with a list of dependencies required by the plugin.
  - A function that performs the decoding with the following function signature as in Github repo:
     def _decode_frame(src: bytes, runner: DecodeRunner) -> bytearray | bytes
-      src is a single frame’s worth of raw compressed data to be decoded, and
+      src is a single frame's worth of raw compressed data to be decoded, and
       runner is a DecodeRunner instance that manages the decoding process.
 
 Adding plugins to a Decoder:
@@ -129,6 +136,26 @@ SUPPORTED_TRANSFER_SYNTAXES: Iterable[UID] = [x.UID for x in SUPPORTED_DECODER_C
 
 _logger = logging.getLogger(__name__)
 
+# Transfer syntaxes that use JPEG Lossless (SOF3) encoding, where sub-16-bit precision
+# causes nvjpeg to silently zero-fill the output buffer
+_JPEG_LOSSLESS_SYNTAXES = (JPEGLosslessDecoder.UID, JPEGLosslessSV1Decoder.UID)
+
+# Set of (tsyntax_str, bits_stored) pairs already warned about; prevents repeated per-frame warnings
+_BITS_STORED_FALLBACK_WARNED: set = set()
+
+# Set of (tsyntax_str, dtype_str) pairs already logged at INFO; subsequent frames log at DEBUG only
+_DECODE_SUCCESS_LOGGED: set = set()
+
+
+class _SuppressFallbackFilter(logging.Filter):
+    """Filter installed on pydicom.pixels.decoders.base to suppress per-frame ERROR logs
+    that pydicom emits whenever a decoder plugin raises NotImplementedError.  We emit a single
+    WARNING ourselves instead, so the repeated ERROR+traceback output is just noise.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        return "nvimgcodec does not reliably decode" not in record.getMessage()
+
 
 # Lazy singleton for nvimgcodec decoder; initialized on first use
 # Decode params are created per-decode based on image characteristics
@@ -179,6 +206,33 @@ def _decode_frame(src: bytes, runner: DecodeRunner) -> bytearray | bytes:
     if not is_available(tsyntax):
         raise ValueError(f"Transfer syntax {tsyntax} not supported; see details in the debug log.")
 
+    # nvimgcodec silently returns zero-filled buffers for JPEG Lossless (SOF3) streams
+    # where 9 <= BitsStored <= 15, e.g. Philips scanners with BitsStored=12
+    #
+    # BitsStored=8 does NOT need this guard: nvimgcodec's lossless decoder internally
+    # rejects UINT8 output (it only supports UINT16), so it falls through to libjpeg-turbo
+    # cleanly without ever calling nvjpegDecodeBatched.  Only the 9-15 range reaches the
+    # buggy nvjpegDecodeBatched path that zero-fills silently
+    #
+    # Raise NotImplementedError so pydicom falls through to the next capable decoder
+    if tsyntax in _JPEG_LOSSLESS_SYNTAXES and 9 <= runner.bits_stored <= 15:
+        warn_key = (str(tsyntax), runner.bits_stored)
+        if warn_key not in _BITS_STORED_FALLBACK_WARNED:
+            _BITS_STORED_FALLBACK_WARNED.add(warn_key)
+            _logger.warning(
+                f"nvimgcodec does not support {tsyntax} with BitsStored={runner.bits_stored} (9-15); "
+                "falling back to non-nvimgcodec decoder for this series"
+            )
+            # Suppress the per-frame ERROR+traceback that pydicom.pixels.decoders.base emits
+            # whenever a plugin raises NotImplementedError — we already logged one warning above
+            _pydicom_base_logger = logging.getLogger("pydicom.pixels.decoders.base")
+            if not any(isinstance(f, _SuppressFallbackFilter) for f in _pydicom_base_logger.filters):
+                _pydicom_base_logger.addFilter(_SuppressFallbackFilter())
+        raise NotImplementedError(
+            f"nvimgcodec does not reliably decode {tsyntax} with BitsStored={runner.bits_stored} (9-15); "
+            "falling back to non-nvimgcodec decoder for this series"
+        )
+
     # runner.set_frame_option(runner.index, "decoding_plugin", NVIMGCODEC_PLUGIN_LABEL)  # type: ignore[attr-defined]
     # in pydicom v3.1.0 can use the above call, but do we want to limit to this plugin?
     is_jpeg2k = tsyntax in JPEG2000TransferSyntaxes
@@ -218,6 +272,11 @@ def _decode_frame(src: bytes, runner: DecodeRunner) -> bytearray | bytes:
             else f"Set photometric_interpretation to RGB for {photometric_interpretation}"
         )
 
+    log_key = (str(tsyntax), str(np_surface.dtype))
+    if log_key not in _DECODE_SUCCESS_LOGGED:
+        _DECODE_SUCCESS_LOGGED.add(log_key)
+        _logger.info(f"nvimgcodec decoding active: tsyntax={tsyntax} dtype={np_surface.dtype}")
+    _logger.debug(f"nvimgcodec decoded frame: tsyntax={tsyntax} shape={np_surface.shape} dtype={np_surface.dtype}")
     return np_surface.tobytes()
 
 

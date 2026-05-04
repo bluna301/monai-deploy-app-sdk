@@ -9,6 +9,7 @@ from pydicom import dcmread
 from pydicom.data import get_testdata_files
 
 from monai.deploy.operators.decoder_nvimgcodec import (
+    _JPEG_LOSSLESS_SYNTAXES,
     SUPPORTED_DECODER_CLASSES,
     SUPPORTED_TRANSFER_SYNTAXES,
     _is_nvimgcodec_available,
@@ -161,6 +162,19 @@ def test_nvimgcodec_decoder_matches_default(path: str) -> None:
 
     rtol = 0.01
     atol = 4.0
+
+    # Skip files with known nvimgcodec limitation: JPEG Lossless with 9 <= BitsStored <= 15
+    try:
+        _ds_meta = dcmread(path, stop_before_pixels=True)
+        _ts = _ds_meta.file_meta.TransferSyntaxUID
+        _bits_stored = getattr(_ds_meta, "BitsStored", 16)
+        if _ts in _JPEG_LOSSLESS_SYNTAXES and 9 <= _bits_stored <= 15:
+            pytest.skip(
+                f"Skipping {Path(path).name}: JPEG Lossless with BitsStored={_bits_stored} (9-15) "
+                "is not supported by nvimgcodec (intentional fallback)"
+            )
+    except Exception:
+        pass
 
     baseline_pixels: np.ndarray = np.array([])
     nv_pixels: np.ndarray = np.array([])
