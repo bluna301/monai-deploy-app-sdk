@@ -1,4 +1,4 @@
-# Copyright 2021-2025 MONAI Consortium
+# Copyright 2021-2026 MONAI Consortium
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -23,9 +23,6 @@ from monai.deploy.exceptions import ItemNotExistsError
 from monai.deploy.utils.importutil import optional_import
 
 dcmread, _ = optional_import("pydicom", name="dcmread")
-get_testdata_file, _ = optional_import("pydicom.data", name="dcmread")
-FileSet, _ = optional_import("pydicom.fileset", name="FileSet")
-generate_uid, _ = optional_import("pydicom.uid", name="generate_uid")
 valuerep, _ = optional_import("pydicom", name="valuerep")
 InvalidDicomError, _ = optional_import("pydicom.errors", name="InvalidDicomError")
 
@@ -47,6 +44,9 @@ class DICOMDataLoaderOperator(Operator):
     SOP_CLASSES_TO_IGNORE = [
         "1.2.840.10008.1.3.10",  # Media Storage Directory Storage, aka DICOMDIR
     ]
+
+    # Reporting
+    DUPLICATE_REPORT_LIMIT = 5
 
     # For now, need to have the input folder as an instance attribute, set on init, because even there is the optional
     # named input to receive data containing the path, there might not be upstream operator to emit the data.
@@ -118,6 +118,11 @@ class DICOMDataLoaderOperator(Operator):
         This method returns a list of studies.
         If there is no studies loaded, an exception will be thrown if set to must load.
 
+        Repeats of the same SOP Instance UID (e.g. duplicate DICOM files) are deduplicated.
+        Instances with different SOP Instance UIDs but the same Image Position Patient values are
+        detected and reported here but not removed; if selected, the DICOMSeriesToVolumeOperator
+        will raise an error.
+
         Args:
             input_path (Path): The folder containing DICOM instance files.
 
@@ -138,6 +143,14 @@ class DICOMDataLoaderOperator(Operator):
             raise ItemNotExistsError(f"No study loaded from path {input_path}.")
 
         return dicom_studies
+
+    @staticmethod
+    def _sop_instance_uid(sop_instance) -> str:
+        """Returns a SOP Instance UID for logging, or a placeholder. Never raises."""
+        try:
+            return str(sop_instance.get("SOPInstanceUID", "unknown"))
+        except Exception:  # noqa: BLE001 - logging helper must not raise
+            return "unknown"
 
     def _list_files(self, path, files: List[str]):
         """Collects fully qualified names of all files recursively given a directory path.
@@ -167,11 +180,16 @@ class DICOMDataLoaderOperator(Operator):
         sop_instances = []
         sop_map: Dict[Tuple[str, str], Dict[Optional[Tuple[float, float, float]], List[Dataset]]] = {}
 
+        # Duplicates tracking
+        duplicate_records: List[Tuple[str, Tuple[float, float, float], str, str]] = []
+        seen_sop_uids: Dict[str, str] = {}
+        repeated_uids: List[Tuple[str, str]] = []
+
         for file in files:
             try:
                 sop_instances.append(dcmread(file))
             except InvalidDicomError as ex:
-                self._logger.warn(f"Ignored {file}, reason being: {ex}")
+                self._logger.warning(f"Ignored {file}, reason being: {ex}")
 
         for sop_instance in sop_instances:
             try:
@@ -179,15 +197,20 @@ class DICOMDataLoaderOperator(Operator):
 
                 # First need to eliminate the SOP instances whose SOP Class is to be ignored.
                 if "SOPInstanceUID" not in sop_instance:
-                    self._logger.warn("Instance ignored due to missing SOP instance UID tag")
+                    self._logger.warning("Instance ignored due to missing SOP instance UID tag")
                     continue
                 sop_instance_uid = sop_instance["SOPInstanceUID"].value
                 if "SOPClassUID" not in sop_instance:
-                    self._logger.warn(f"Instance ignored due to missing SOP Class UID tag, {sop_instance_uid}")
+                    self._logger.warning(f"Instance ignored due to missing SOP Class UID tag, {sop_instance_uid}")
                     continue
                 if sop_instance["SOPClassUID"].value in DICOMDataLoaderOperator.SOP_CLASSES_TO_IGNORE:
-                    self._logger.warn(f"Instance ignored for being in the ignored class, {sop_instance_uid}")
+                    self._logger.warning(f"Instance ignored for being in the ignored class, {sop_instance_uid}")
                     continue
+
+                if sop_instance_uid in seen_sop_uids:
+                    repeated_uids.append((str(sop_instance_uid), seen_sop_uids[sop_instance_uid]))
+                    continue
+                seen_sop_uids[str(sop_instance_uid)] = study_instance_uid
 
                 if study_instance_uid not in study_dict:
                     study = DICOMStudy(study_instance_uid)
@@ -199,8 +222,8 @@ class DICOMDataLoaderOperator(Operator):
                 if series_instance_uid not in series_dict:
                     series = DICOMSeries(series_instance_uid)
                     series_dict[series_instance_uid] = series
-                    self.populate_series_attributes(series, sop_instance)
                     study_dict[study_instance_uid].add_series(series)
+                    self.populate_series_attributes(series, sop_instance)
 
                 # Prepare sop_map entry
                 series_key = (study_instance_uid, series_instance_uid)
@@ -211,7 +234,7 @@ class DICOMDataLoaderOperator(Operator):
                     ipp_tuple = cast(Tuple[float, float, float], tuple(float(v) for v in ipp))
                 else:
                     # Non-image files will be missing IPP; store SOP instance under "None" key, move on to next SOP instance
-                    sop_map[series_key].setdefault(ipp, []).append(sop_instance)
+                    sop_map[series_key].setdefault(None, []).append(sop_instance)
                     continue
 
                 sop_list = sop_map[series_key].setdefault(ipp_tuple, [])
@@ -219,42 +242,44 @@ class DICOMDataLoaderOperator(Operator):
                 if not sop_list:
                     # First occurrence of this spatial position — store the SOP instance
                     sop_list.append(sop_instance)
-                else:
-                    # Duplicate spatial location found — compare AcquisitionNumbers (if absent, set to -1)
-                    exist = sop_list[0]
-                    exist_acq_num = int(exist.get("AcquisitionNumber", -1))
-                    curr_acq_num = int(sop_instance.get("AcquisitionNumber", -1))
-                    if curr_acq_num > exist_acq_num:
-                        # Current SOP instance AcquisitionNumber is greater - replace existing SOP instance
-                        self._logger.info(
-                            f"Duplicate spatial coordinates detected; removing duplicate SOP at IPP {ipp_tuple} "
-                            f"in Series {series_instance_uid}; removed SOP instance with lower AcquisitionNumber "
-                            f"({curr_acq_num} < {exist_acq_num})"
-                        )
-                        sop_list[0] = sop_instance
-                    elif curr_acq_num < exist_acq_num:
-                        # Existing SOP instance AcquisitionNumber is greater - don't store current SOP instance
-                        self._logger.info(
-                            f"Duplicate spatial coordinates detected; removing duplicate SOP at IPP {ipp_tuple} "
-                            f"in Series {series_instance_uid}; kept SOP instance with higher AcquisitionNumber "
-                            f"({exist_acq_num} > {curr_acq_num})"
-                        )
-                    elif curr_acq_num == -1:
-                        # AcquisitionNumber tag is absent for compared SOP instances - don't store current SOP instance
-                        self._logger.info(
-                            f"Duplicate spatial coordinates detected; removing duplicate SOP at IPP {ipp_tuple} "
-                            f"in Series {series_instance_uid}; AcquisitionNumber tags are absent"
-                        )
-                    else:
-                        # AcquisitionNumber tag values are equal for compared SOP instances - don't store current SOP instance
-                        self._logger.info(
-                            f"Duplicate spatial coordinates detected; removing duplicate SOP at IPP {ipp_tuple} "
-                            f"in Series {series_instance_uid}; AcquisitionNumber tag values are equal "
-                            f"({exist_acq_num} = {curr_acq_num})"
-                        )
+                    continue
+
+                # Duplicate spatial location found
+                duplicate_records.append(
+                    (
+                        series_instance_uid,
+                        ipp_tuple,
+                        self._sop_instance_uid(sop_list[0]),
+                        self._sop_instance_uid(sop_instance),
+                    )
+                )
+                sop_list.append(sop_instance)
 
             except Exception as ex:
-                self._logger.warn(f"Error parsing SOP Instance: {ex}")
+                self._logger.warning(f"Error parsing SOP Instance: {ex}")
+
+        if repeated_uids:
+            sample_uids = [uid for uid, _ in repeated_uids[:3]]
+            self._logger.warning(
+                f"Skipped {len(repeated_uids)} file(s) carrying a SOP Instance UID already loaded. "
+                f"These are repeats of the same instance, so only the first occurrence was kept; "
+                f"Example UID(s): {sample_uids}"
+            )
+
+        if duplicate_records:
+            shown = duplicate_records[: self.DUPLICATE_REPORT_LIMIT]
+            detail = "\n".join(
+                f"  Series {uid}: Image Position Patient {pos}, SOP Instance UIDs {first} and {second}"
+                for uid, pos, first, second in shown
+            )
+            if len(duplicate_records) > len(shown):
+                detail += f"\n  ... and {len(duplicate_records) - len(shown)} more"
+            self._logger.warning(
+                f"{len(duplicate_records)} instance(s) across "
+                f"{len({uid for uid, _, _, _ in duplicate_records})} series share an Image Position "
+                f"Patient with another instance in the same series. All were loaded unchanged. "
+                f"DICOMSeriesToVolumeOperator will refuse a series whose instances share a position\n{detail}"
+            )
 
         # Add unique SOPs to series_dict following potential duplication removal
         for (_, series_uid), ipp_dict in sop_map.items():
@@ -310,7 +335,7 @@ class DICOMDataLoaderOperator(Operator):
         """Populates series level attributes in the study data structure.
 
         Args:
-            study: A DICOM Series instance that needs to be filled-in with series level attribute values
+            series: A DICOM Series instance that needs to be filled-in with series level attribute values
             sop_instance: A sample DICOM SOP Instance that contains the list of attributed which will be parsed
         """
         try:
@@ -379,23 +404,26 @@ class DICOMDataLoaderOperator(Operator):
             if tag_pixel_spacing in sop_instance:
                 pixel_spacing_de = sop_instance[tag_pixel_spacing]
             elif tag_imager_pixel_spacing in sop_instance:
+                self._logger.warning(
+                    f"PixelSpacing (0028,0030) is absent; falling back to ImagerPixelSpacing "
+                    f"(0018,1164) for Series {getattr(series, 'SeriesInstanceUID', 'unknown')}"
+                )
                 pixel_spacing_de = sop_instance[tag_imager_pixel_spacing]
             else:
-                raise KeyError("Neither {tag_pixel_spacing} nor {tag_imager_pixel_spacing} in dataset header.")
-            if pixel_spacing_de is not None:
-                series.row_pixel_spacing = pixel_spacing_de.value[0]
-                series.col_pixel_spacing = pixel_spacing_de.value[1]
-        except KeyError:
+                raise KeyError(f"Neither {tag_pixel_spacing} nor {tag_imager_pixel_spacing} in dataset header")
+            if pixel_spacing_de is not None and len(pixel_spacing_de.value) >= 2:
+                series.row_pixel_spacing = float(pixel_spacing_de.value[0])
+                series.col_pixel_spacing = float(pixel_spacing_de.value[1])
+        except (KeyError, IndexError, TypeError, ValueError):
             pass
 
         try:
-            image_orientation_paient_de = sop_instance[0x0020, 0x0037]
-            if image_orientation_paient_de is not None:
-                orientation_orig = image_orientation_paient_de.value
+            image_orientation_patient_de = sop_instance[0x0020, 0x0037]
+            if image_orientation_patient_de is not None:
+                orientation_orig = image_orientation_patient_de.value
                 orientation = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-                for index, _ in enumerate(orientation_orig):
+                for index in range(min(len(orientation_orig), len(orientation))):
                     orientation[index] = float(orientation_orig[index])
-
                 series.row_direction_cosine = orientation[0:3]
                 series.col_direction_cosine = orientation[3:6]
 

@@ -9,9 +9,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
+import collections
 import logging
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -27,12 +27,21 @@ from monai.deploy.core.domain.image import Image
 from . import decoder_nvimgcodec
 
 
+class SliceGeometryError(ValueError):
+    """Raised when a series' slice geometry cannot be represented as a single 3D volume."""
+
+
 class DICOMSeriesToVolumeOperator(Operator):
     """This operator converts an instance of DICOMSeries into an Image object.
 
     The loaded Image Object can be used for further processing via other operators.
     The data array will be a 3D image NumPy array with index order of `DHW`.
     Channel is limited to 1 as of now, and `C` is absent in the NumPy array.
+
+    Supports uniformly spaced acquisitions; refuses uniform-with-interior-gaps acquisitions
+    and non-uniform acquisitions (irregular spacing) unconditionally. The slices of a series
+    must also share Image Orientation Patient, Pixel Spacing, and in-plane dimensions;
+    series that mix geometries are not supported.
 
     Named Input:
         study_selected_series_list: List of StudySelectedSeries.
@@ -41,6 +50,8 @@ class DICOMSeriesToVolumeOperator(Operator):
     """
 
     # Use constants instead of enums in monai to avoid dependency at this level.
+
+    # Space keys for coordinate systems
     MONAI_UTIL_ENUMS_SPACEKEYS_RAS = "RAS"
     MONAI_UTIL_ENUMS_SPACEKEYS_LPS = "LPS"
     MONAI_TRANSFORMS_SPATIAL_METADATA_NAME = "space"
@@ -48,8 +59,38 @@ class DICOMSeriesToVolumeOperator(Operator):
     METADATA_SPACE_LPS = {MONAI_TRANSFORMS_SPATIAL_METADATA_NAME: MONAI_UTIL_ENUMS_SPACEKEYS_LPS}
     ATTRIBUTE_NIFTI_AFFINE = "nifti_affine_transform"
     ATTRIBUTE_DICOM_AFFINE = "dicom_affine_transform"
+    DEFAULT_DEPTH_PIXEL_SPACING = 1.0  # for CR image, similar to (Simple) ITK
 
-    def __init__(self, fragment: Fragment, *args, affine_lps_to_ras: bool = True, **kwargs):
+    # Slice spacing categories
+    SPACING_UNIFORM = "uniform"
+    SPACING_UNIFORM_WITH_INTERIOR_GAPS = "uniform_with_interior_gaps"
+    SPACING_IRREGULAR = "irregular"
+
+    # Tolerances
+    ORIENTATION_LOG_ATOL = 1e-6
+    ORIENTATION_RAISE_ATOL = 1e-5
+    COSINE_ORTHOGONALITY_ATOL = 1e-6
+    COSINE_ORTHOGONALITY_RAISE_ATOL = 1e-4
+    COSINE_NORM_ATOL = 1e-6
+    COSINE_NORM_RAISE_ATOL = 1e-4
+    PIXEL_SPACING_LOG_RTOL = 1e-6
+    PIXEL_SPACING_RAISE_RTOL = 1e-4
+    DUPLICATE_POSITION_ATOL_MM = 1e-4
+    DETERMINANT_RTOL = 1e-9
+
+    # Reporting
+    DUPLICATE_REPORT_LIMIT = 5
+    TRACE_HEAD_TAIL = 5
+
+    def __init__(
+        self,
+        fragment: Fragment,
+        *args,
+        affine_lps_to_ras: bool = True,
+        grid_residual_rtol: float = 0.1,
+        slice_spacing_rtol: float = 0.01,
+        **kwargs,
+    ):
         """Create an instance for a containing application object.
 
         This operator converts instances of DICOMSeries into an Image object.
@@ -63,7 +104,8 @@ class DICOMSeriesToVolumeOperator(Operator):
         based decoder plugins are available at runtime.
 
         Registering the decoder plugin is all automatic and does not require any additional change in user's application
-        except for adding a dependency on the `nvidia-nvimgcodec-cu13` and `all` of its optional dependencies.
+        except for adding a dependency on the `nvimgcodec-cu12` and `nvidia-nvjpeg2k-cu12` packages (suffix of
+        cu12 means CUDA 12.0 though cu13 is also supported).
 
         Named Input:
             study_selected_series_list: List of StudySelectedSeries.
@@ -74,13 +116,35 @@ class DICOMSeriesToVolumeOperator(Operator):
             fragment (Fragment): An instance of the Application class which is derived from Fragment.
             affine_lps_to_ras (bool): If true, the affine transform in the image metadata is RAS oriented,
                                       otherwise it is LPS oriented. Default is True.
+            grid_residual_rtol (float): How far any slice may sit off the regular grid implied by
+                                      the base spacing, as a fraction of that spacing. This is the
+                                      cumulative drift check, as distinct from the pairwise gap
+                                      comparison governed by slice_spacing_rtol. Default is 0.1, i.e.
+                                      a tenth of a slice.
+            slice_spacing_rtol (float): Relative tolerance for comparing adjacent slice spacings.
+                                      Default is 0.01.
         """
 
+        for name, value in (
+            ("grid_residual_rtol", grid_residual_rtol),
+            ("slice_spacing_rtol", slice_spacing_rtol),
+        ):
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"{name} must be a positive finite number, got {value!r}") from None
+            if not np.isfinite(numeric) or numeric <= 0.0:
+                raise ValueError(f"{name} must be a positive finite number, got {value!r}")
+
+        self._logger = logging.getLogger("{}.{}".format(__name__, type(self).__name__))
         self.input_name_series = "study_selected_series_list"
         self.output_name_image = "image"
         self.affine_lps_to_ras = affine_lps_to_ras
+        self.grid_residual_rtol = float(grid_residual_rtol)
+        self.slice_spacing_rtol = float(slice_spacing_rtol)
+
         if not decoder_nvimgcodec.register_as_decoder_plugin():
-            logging.warning("The nvimgcodec decoder plugin did not register successfully.")
+            self._logger.warning("The nvimgcodec decoder plugin did not register successfully.")
 
         # Need to call the base class constructor last
         super().__init__(fragment, *args, **kwargs)
@@ -99,6 +163,48 @@ class DICOMSeriesToVolumeOperator(Operator):
         image = self.convert_to_image(study_selected_series_list)
         op_output.emit(image, self.output_name_image)
 
+    # ------------------------------------------------------------------ #
+    # Logging Helpers
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def _fmt_seq(cls, values: Union[Sequence, np.ndarray], fmt: str = "{:.4f}") -> str:
+        """Formats a sequence for logging, eliding the middle if it is long."""
+        try:
+            items = [fmt.format(float(v)) for v in values]
+        except (TypeError, ValueError):
+            items = [str(v) for v in values]
+        n = cls.TRACE_HEAD_TAIL
+        if len(items) <= 2 * n:
+            return "[" + ", ".join(items) + "]"
+        return "[" + ", ".join(items[:n]) + f", ... ({len(items) - 2 * n} more) ..., " + ", ".join(items[-n:]) + "]"
+
+    @staticmethod
+    def _fmt_matrix(matrix: np.ndarray) -> str:
+        """Formats a 4x4 affine for logging, one row per line."""
+        return "\n".join("    [" + "  ".join(f"{v: 12.6f}" for v in row) + "]" for row in np.asarray(matrix))
+
+    @staticmethod
+    def _sop_uid(sop_instance) -> str:
+        """Returns an instance's SOP Instance UID for logging, or a placeholder. Never raises."""
+        try:
+            native = sop_instance.get_native_sop_instance()
+            return str(getattr(native, "SOPInstanceUID", "unknown"))
+        except Exception:  # noqa: BLE001 - logging helper must not raise
+            return "unknown"
+
+    @staticmethod
+    def _instance_number(sop_instance) -> str:
+        """Returns an instance's Instance Number (0020,0013) for logging, or a placeholder. Never raises."""
+        try:
+            native = sop_instance.get_native_sop_instance()
+            value = getattr(native, "InstanceNumber", None)
+            return str(value) if value is not None else "unknown"
+        except Exception:  # noqa: BLE001 - logging helper must not raise
+            return "unknown"
+
+    # ------------------------------------------------------------------ #
+    # Core Logic
+    # ------------------------------------------------------------------ #
     def convert_to_image(self, study_selected_series_list: List[StudySelectedSeries]) -> Union[Image, None]:
         """Extracts the pixel data from a DICOM Series and other attributes to create an Image object"""
         # For now, only supports the one and only one selected series.
@@ -111,6 +217,7 @@ class DICOMSeriesToVolumeOperator(Operator):
             selected_series = study_selected_series.selected_series[0]
             dicom_series = selected_series.series
             selection_name = selected_series.selection_name
+
             self.prepare_series(dicom_series)
             metadata = self.create_metadata(dicom_series)
 
@@ -118,6 +225,7 @@ class DICOMSeriesToVolumeOperator(Operator):
             metadata.update(self._get_instance_properties(study_selected_series.study))
             selection_metadata = {"selection_name": selection_name}
             metadata.update(selection_metadata)
+
             # The affine transform and the coordinate space are set based on the flag affine_lps_to_ras.
             # If the flag is true, the NIFTI affine (RAS) is used, otherwise the DICOM affine (LPS) is used.
             if self.affine_lps_to_ras:
@@ -130,6 +238,18 @@ class DICOMSeriesToVolumeOperator(Operator):
                 metadata.update(self.METADATA_SPACE_LPS)
 
             voxel_data = self.generate_voxel_data(dicom_series)
+
+            # The volume is built from series._sop_instances, the same list the geometry was
+            # derived from. If a fix ever lets those two drift apart, every array index
+            # after the divergence maps to the wrong patient position, silently. Check it
+            expected_planes = len(dicom_series.get_sop_instances())
+            if voxel_data.ndim == 3 and voxel_data.shape[0] != expected_planes:
+                raise SliceGeometryError(
+                    f"Volume has {voxel_data.shape[0]} planes but the series holds {expected_planes} "
+                    f"SOP instances after geometry analysis. The array and the affine would describe "
+                    f"different stacks"
+                )
+
             image = self.create_volumetric_image(voxel_data, metadata)
 
             # Now it is time to assign the converted image to the SelectedSeries obj
@@ -146,7 +266,8 @@ class DICOMSeriesToVolumeOperator(Operator):
 
         Supports monochrome image only for now. Photometric Interpretation attribute,
         tag (0028,0004), is considered. Both MONOCHROME2 (IDENTITY) and MONOCHROME1 (INVERSE)
-        result in an output image where The minimum sample value is intended to be displayed as black.
+        result in an output image where the minimum sample value is intended to be displayed
+        as black.
 
         Args:
             series: DICOM Series for which the pixel data needs to be extracted.
@@ -165,6 +286,27 @@ class DICOMSeriesToVolumeOperator(Operator):
             if not sop_instance:
                 return np.array([])
 
+            # pydicom's DS parser accepts "NaN" and "inf" in its default validation mode, and
+            # apply_rescale multiplies through, so a non-finite Rescale Slope or Intercept would
+            # yield an all-NaN or all-inf slice that every cast test below rejects, leaving a float64
+            # plane that reaches inference without error. A zero-length value fails inside
+            # apply_rescale as a generic error. Checked outside the try so the error is not rewrapped
+            # as a generic rescale failure. Checked only when pydicom will apply the rescale: both
+            # tags present and no Modality LUT Sequence (0028,3000), which takes precedence. Absent is
+            # fine: apply_rescale then uses the Modality LUT, or leaves the stored values unchanged.
+            # A present Modality LUT Sequence reads as "empty" or "unparsable", never "absent"
+            rescale_tags = (((0x0028, 0x1053), "Rescale Slope"), ((0x0028, 0x1052), "Rescale Intercept"))
+            rescale_states = [(tag, keyword, *self._tag_state(sop_instance, tag, 1)) for tag, keyword in rescale_tags]
+            modality_lut_state, _ = self._tag_state(sop_instance, (0x0028, 0x3000), 1)
+            if modality_lut_state == "absent" and all(state != "absent" for _, _, state, _ in rescale_states):
+                for tag, keyword, state, raw in rescale_states:
+                    if state in ("empty", "unparsable", "non-finite"):
+                        raise ValueError(
+                            f"{keyword} ({tag[0]:04X},{tag[1]:04X}) is {state}, stored as {raw}; the "
+                            f"slice cannot be rescaled to modality values. SOP Instance UID "
+                            f"{self._sop_uid(sop_instance)}, Instance Number {self._instance_number(sop_instance)}"
+                        )
+
             native_sop = None
             try:
                 native_sop = sop_instance.get_native_sop_instance()
@@ -173,28 +315,28 @@ class DICOMSeriesToVolumeOperator(Operator):
                 # apply the presentation lut.
                 rescaled_pixel_data = apply_presentation_lut(rescaled_pixel_data, native_sop)
             except Exception as e:
-                logging.error(f"Failed to apply rescale to DICOM volume: {e}")
+                self._logger.error(f"Failed to apply rescale to DICOM volume: {e}")
                 raise RuntimeError("Failed to apply rescale to DICOM volume.") from e
 
             # The following tests are expecting the array is already of the Numpy type.
             if rescaled_pixel_data.dtype == np.uint8 or rescaled_pixel_data.dtype == np.uint16:
-                logging.debug("Rescaled pixel array is already of type uint8 or uint16.")
+                self._logger.debug("Rescaled pixel array is already of type uint8 or uint16.")
             # Check if casting to uint16 and back to float results in the same values.
             elif np.all(rescaled_pixel_data > 0) and np.array_equal(
                 rescaled_pixel_data, rescaled_pixel_data.astype(np.uint16)
             ):
-                logging.debug("Rescaled pixel array can be safely casted to uint16 with equivalence test.")
+                self._logger.debug("Rescaled pixel array can be safely casted to uint16 with equivalence test.")
                 rescaled_pixel_data = rescaled_pixel_data.astype(dtype=np.uint16)
             # Check if casting to int16 and back to float results in the same values.
             elif np.array_equal(rescaled_pixel_data, rescaled_pixel_data.astype(np.int16)):
-                logging.debug("Rescaled pixel array can be safely casted to int16 with equivalence test.")
+                self._logger.debug("Rescaled pixel array can be safely casted to int16 with equivalence test.")
                 rescaled_pixel_data = rescaled_pixel_data.astype(dtype=np.int16)
             # Check casting to float32 with equivalence test
             elif np.array_equal(rescaled_pixel_data, rescaled_pixel_data.astype(np.float32)):
-                logging.debug("Rescaled pixel array can be safely casted to float32 with equivalence test.")
+                self._logger.debug("Rescaled pixel array can be safely casted to float32 with equivalence test.")
                 rescaled_pixel_data = rescaled_pixel_data.astype(np.float32)
             else:
-                logging.debug("Rescaled pixel data remains as of type float64.")
+                self._logger.debug("Rescaled pixel data remains as of type float64.")
 
             return rescaled_pixel_data
 
@@ -208,6 +350,7 @@ class DICOMSeriesToVolumeOperator(Operator):
         # before stacking them into a single 3D volume. This can be inefficient for series
         # with many slices.
         if not slices:
+            self._logger.warning("No SOP instances to build voxel data from; returning an empty array")
             return np.array([])
 
         # Get shape and dtype from the first slice to pre-allocate numpy array.
@@ -216,7 +359,7 @@ class DICOMSeriesToVolumeOperator(Operator):
             vol_shape = (len(slices),) + first_slice_pixel_array.shape
             dtype = first_slice_pixel_array.dtype
         except Exception as e:
-            logging.error(f"Failed to get pixel array from the first slice: {e}")
+            self._logger.error(f"Failed to get pixel array from the first slice: {e}")
             raise
 
         # Pre-allocate the volume data array.
@@ -228,7 +371,7 @@ class DICOMSeriesToVolumeOperator(Operator):
             try:
                 vol_data[i] = _get_rescaled_pixel_array(s)
             except Exception as e:
-                logging.error(f"Failed to get pixel array from slice {i}: {e}")
+                self._logger.error(f"Failed to get pixel array from slice {i}: {e}")
                 raise
 
         return vol_data
@@ -246,212 +389,1512 @@ class DICOMSeriesToVolumeOperator(Operator):
         image = Image(vox_data, metadata)
         return image
 
-    def prepare_series(self, series):
-        """Computes the slice normal for each slice and then projects the first voxel of each
-        slice on that slice normal.
+    # ------------------------------------------------------------------ #
+    # Geometry Helpers
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _get_tag_value(sop_instance, tag) -> Optional[list]:
+        """Returns a DICOM tag's value as a list of floats, or None if absent, empty, unparsable, or non-finite."""
+        try:
+            data_element = sop_instance[tag]
+        except (KeyError, TypeError):
+            return None
+        if data_element is None or data_element.value is None:
+            return None
+        value = data_element.value
+        # Single-valued numeric elements (DS, IS) arrive as scalars, not sequences; iterating them raises
+        # TypeError. Normalize to a list first
+        if isinstance(value, (str, bytes)) or not hasattr(value, "__iter__"):
+            value = [value]
+        try:
+            parsed = [float(v) for v in value]
+        except (TypeError, ValueError):
+            return None
+        if not all(np.isfinite(v) for v in parsed):
+            return None
+        return parsed
 
-        It computes the distance of that point from the origin of the patient coordinate system along the slice normal.
-        It orders the slices in the series according to that distance.
+    @staticmethod
+    def _tag_state(sop_instance, tag, expected_length: int) -> Tuple[str, Optional[str]]:
+        """Says why a numeric tag is unusable, for log and error messages only.
+
+        Returns (state, raw), where raw is a short repr of the stored value, or None if absent.
+
+          absent      the element is not in the dataset
+          empty       the element is present with no value (zero-length)
+          unparsable  the value is present but is not numeric
+          non-finite  the value parses but contains NaN or infinity
+          short       the value parses but has fewer than expected_length components
+          ok          usable
+        """
+        try:
+            data_element = sop_instance[tag]
+        except (KeyError, TypeError):
+            return "absent", None
+        if data_element is None:
+            return "absent", None
+        value = data_element.value
+        raw = repr(value)
+        raw = raw if len(raw) <= 80 else raw[:77] + "..."
+        if value is None or (hasattr(value, "__len__") and len(value) == 0):
+            return "empty", raw
+        if isinstance(value, (str, bytes)) or not hasattr(value, "__iter__"):
+            value = [value]
+        try:
+            parsed = [float(v) for v in value]
+        except (TypeError, ValueError):
+            return "unparsable", raw
+        if not all(np.isfinite(v) for v in parsed):
+            return "non-finite", raw
+        if len(parsed) < expected_length:
+            return f"short: {len(parsed)} of {expected_length} values", raw
+        return "ok", raw
+
+    def _slice_normal(self, iop) -> np.ndarray:
+        """Computes the slice normal from the raw Image Orientation Patient direction cosines.
+
+        Image Orientation Patient (0020,0037) holds direction cosines, which are unit vectors / normal
+        by definition but often arrive as rounded Decimal Strings (i.e. not exactly normal). Normalizing
+        the direction cosines would mean potentially reporting geometry that is not present; instead the
+        deviation is checked against COSINE_NORM_RAISE_ATOL in compute_affine_transform, and raw cosine
+        values are used throughout.
+        """
+        row_cosine = np.asarray(iop[0:3], dtype=float)
+        col_cosine = np.asarray(iop[3:6], dtype=float)
+        normal: np.ndarray = np.cross(row_cosine, col_cosine)
+        norm = float(np.linalg.norm(normal))
+        orthogonality = float(np.dot(row_cosine, col_cosine))
+
+        self._logger.info(f"Image Orientation Patient: {self._fmt_seq(iop[:6], '{:.10g}')}")
+
+        self._logger.debug(
+            f"Row Cosine (r): {self._fmt_seq(row_cosine, '{:.10g}')}, |r|={np.linalg.norm(row_cosine):.10f}"
+        )
+        self._logger.debug(
+            f"Col Cosine (c): {self._fmt_seq(col_cosine, '{:.10g}')}, |c|={np.linalg.norm(col_cosine):.10f}"
+        )
+        self._logger.debug(f"Orthogonality: r ⋅ c = {orthogonality:.3e} (0 if perfectly orthogonal)")
+        self._logger.info(
+            f"Slice Normal (n): {self._fmt_seq(normal, '{:.10g}')}, "
+            f"|n|={norm:.12f}. Direction the slice planes face"
+        )
+
+        if norm <= 0.0:
+            raise SliceGeometryError(
+                f"Image Orientation Patient does not define a slice plane; "
+                f"row and column cosines are parallel or zero: {iop}"
+            )
+
+        if abs(orthogonality) > self.COSINE_ORTHOGONALITY_RAISE_ATOL:
+            raise SliceGeometryError(
+                f"Row and column direction cosines in Image Orientation Patient (0020,0037) are not "
+                f"orthogonal: dot product {orthogonality:.6e}, which is "
+                f"{np.degrees(np.arcsin(np.clip(abs(orthogonality), -1.0, 1.0))):.4f} °'s off "
+                f"square, above the limit of {self.COSINE_ORTHOGONALITY_RAISE_ATOL}. The in-plane "
+                f"axes of the affine are not orthogonal and the slice normal derived from "
+                f"their cross product is not the true plane normal; no rescaling can fix this, "
+                f"because which of the two cosines is wrong cannot be known. The header is most "
+                f"likely corrupt, or the sender wrote Image Orientation Patient to very few "
+                f"decimal places: {list(iop[:6])}"
+            )
+
+        if abs(orthogonality) > self.COSINE_ORTHOGONALITY_ATOL:
+            self._logger.warning(
+                f"Row and column direction cosines in Image Orientation Patient (0020,0037) are not "
+                f"orthogonal (dot product {orthogonality:.6e}, log threshold {self.COSINE_ORTHOGONALITY_ATOL}, "
+                f"raise threshold {self.COSINE_ORTHOGONALITY_RAISE_ATOL}); the slice normal is "
+                f"approximate and the in-plane axes of the affine are not exactly orthogonal"
+            )
+
+        return normal
+
+    def _validate_orientation_consistency(self, iop_list: List[list]) -> None:
+        """Every SOP instance in the series must share the same image orientation.
+
+        Slice ordering is by projection onto the slice normal. If instances carry different
+        orientations then their projections are onto different axes and are not comparable.
+
+        Deviations above ORIENTATION_LOG_ATOL are reported, because they mean the Image
+        Orientation Patient strings are not byte-identical across the series. Only deviations
+        above ORIENTATION_RAISE_ATOL are fatal, so that a series with rounding jitter is
+        described rather than rejected.
+        """
+        reference = np.asarray(iop_list[0], dtype=float)
+        deviations = []
+        for index, iop in enumerate(iop_list[1:], start=1):
+            deviation = float(np.max(np.abs(np.asarray(iop, dtype=float) - reference)))
+            deviations.append(deviation)
+            if deviation > self.ORIENTATION_RAISE_ATOL:
+                raise SliceGeometryError(
+                    f"Image Orientation Patient is not consistent across the series. "
+                    f"Instance 0 has {list(reference)}, instance {index} has {list(iop)} "
+                    f"(max component deviation {deviation:.6f}, limit {self.ORIENTATION_RAISE_ATOL}). "
+                    f"The series may contain more than one acquisition or orientation"
+                )
+
+        if not deviations:
+            return
+
+        worst = max(deviations)
+        self._logger.debug(
+            f"Orientation consistent across {len(iop_list)} instances; "
+            f"max component deviation from instance 0 = {worst:.3e} "
+            f"(log threshold {self.ORIENTATION_LOG_ATOL}, raise threshold {self.ORIENTATION_RAISE_ATOL})"
+        )
+        if worst > self.ORIENTATION_LOG_ATOL:
+            self._logger.warning(
+                f"Image Orientation Patient varies across the series by up to {worst:.6e} per component. "
+                f"Below the {self.ORIENTATION_RAISE_ATOL} rejection threshold, so the orientation of the "
+                f"first instance is used for the normal and the affine, but the slice planes are not "
+                f"exactly parallel"
+            )
+
+    def _validate_pixel_spacing_consistency(self, ps_list: List[Optional[list]], sop_instances) -> None:
+        """Every SOP instance must declare the same in-plane Pixel Spacing (0028,0030).
+
+        The affine takes the first slice's Pixel Spacing and applies it to every plane, so a
+        slice whose in-plane spacing differs would be scaled wrongly.
+        """
+
+        def _unusable(ps: Optional[list]) -> bool:
+            """True when Pixel Spacing cannot scale an affine column.
+
+            Absent, short, non-finite and non-positive all qualify. A zero or NaN element has
+            to be caught here rather than by the relative comparison below: that comparison
+            divides by the reference, so an all-zero series yields 0/0 = nan, and max(0.0, nan)
+            returns 0.0 in Python -- the series passes silently and the affine comes out
+            singular, with only invariants 5a/5b noticing and only as a warning.
+            """
+            if ps is None or len(ps) < 2:
+                return True
+            values = np.asarray(ps[:2], dtype=float)
+            return bool(not np.all(np.isfinite(values)) or np.any(values <= 0.0))
+
+        missing = [i for i, ps in enumerate(ps_list) if _unusable(ps)]
+
+        if missing:
+            shown = missing[: self.DUPLICATE_REPORT_LIMIT]
+
+            def _reason(i: int) -> str:
+                ps = ps_list[i]
+                if ps is not None and len(ps) >= 2:
+                    return f"non-positive {ps[:2]}"
+                state, raw = self._tag_state(sop_instances[i], (0x0028, 0x0030), 2)
+                return state if raw is None else f"{state}, stored as {raw}"
+
+            detail = "\n".join(
+                f"  array index {i}: Pixel Spacing {_reason(i)}, "
+                f"SOP Instance UID {self._sop_uid(sop_instances[i])}, "
+                f"Instance Number {self._instance_number(sop_instances[i])}"
+                for i in shown
+            )
+            if len(missing) > len(shown):
+                detail += f"\n  ... and {len(missing) - len(shown)} more"
+            raise SliceGeometryError(
+                f"Pixel Spacing (0028,0030) is absent, malformed, or not a pair of positive "
+                f"finite numbers on {len(missing)} of {len(ps_list)} instance(s) that carry "
+                f"orientation and position. The affine scales its in-plane axes by this value, so "
+                f"it cannot be built. The series may be malformed or combine more than one "
+                f"acquisition\n{detail}"
+            )
+
+        # Every entry is present here: the check above raised on any absent Pixel Spacing, so this
+        # keeps the array indices of ps_list and only narrows the type
+        spacings: List[list] = [ps for ps in ps_list if ps is not None]
+        reference = np.asarray(spacings[0][:2], dtype=float)
+        worst = 0.0
+        offenders: List[Tuple[int, np.ndarray, float]] = []
+        for index in range(1, len(spacings)):
+            ps = np.asarray(spacings[index][:2], dtype=float)
+            rel = float(np.max(np.abs(ps - reference) / np.abs(reference)))
+            worst = max(worst, rel)
+            if rel > self.PIXEL_SPACING_RAISE_RTOL:
+                offenders.append((index, ps, rel))
+
+        if offenders:
+            shown_offenders = offenders[: self.DUPLICATE_REPORT_LIMIT]
+            detail = "\n".join(
+                f"  array index {i}: Pixel Spacing {list(ps)} (relative deviation {rel:.3e}), "
+                f"SOP Instance UID {self._sop_uid(sop_instances[i])}, "
+                f"Instance Number {self._instance_number(sop_instances[i])}"
+                for i, ps, rel in shown_offenders
+            )
+            if len(offenders) > len(shown_offenders):
+                detail += f"\n  ... and {len(offenders) - len(shown_offenders)} more"
+            raise SliceGeometryError(
+                f"Pixel Spacing (0028,0030) is not consistent across the series: {len(offenders)} "
+                f"instance(s) differ from the first slice's {list(reference)} by more than "
+                f"{self.PIXEL_SPACING_RAISE_RTOL} (relative). The affine applies the first slice's "
+                f"spacing to the whole volume, so the in-plane scale of the differing slice(s) would "
+                f"be wrong. The series may combine more than one acquisition.\n{detail}"
+            )
+
+        if worst > self.PIXEL_SPACING_LOG_RTOL:
+            self._logger.warning(
+                f"Pixel Spacing varies across the series by up to {worst:.3e} (relative), below the "
+                f"{self.PIXEL_SPACING_RAISE_RTOL} rejection threshold; the first slice's value is used "
+                f"for the whole volume"
+            )
+        else:
+            self._logger.debug(
+                f"Pixel Spacing consistent across {len(ps_list)} instances; max relative "
+                f"deviation {worst:.3e} (log {self.PIXEL_SPACING_LOG_RTOL}, raise {self.PIXEL_SPACING_RAISE_RTOL})"
+            )
+
+    def _validate_dimensions_consistency(self, dim_list: List[Optional[Tuple[int, int]]], sop_instances) -> None:
+        """Every SOP instance must share Rows (0028,0010) and Columns (0028,0011).
+
+        The volume is stacked into one array pre-allocated from the first slice's shape, so a
+        slice of a different size would otherwise raise a bare NumPy broadcast error from inside
+        generate_voxel_data, misattributed to a pixel-read failure.
+
+        Instances that do not carry both tags are skipped rather than refused; the pixel decode in
+        generate_voxel_data will fail on a genuinely unreadable instance.
+        """
+        present = [(i, d) for i, d in enumerate(dim_list) if d is not None]
+        skipped = len(dim_list) - len(present)
+        if skipped:
+            self._logger.debug(f"{skipped} instance(s) lack Rows/Columns; excluded from the dimension check")
+        if len(present) < 2:
+            return
+
+        _, reference = present[0]
+        offenders = [(i, d) for i, d in present[1:] if d != reference]
+        if offenders:
+            shown = offenders[: self.DUPLICATE_REPORT_LIMIT]
+            detail = "\n".join(
+                f"  array index {i}: Rows x Columns {d[0]}x{d[1]}, "
+                f"SOP Instance UID {self._sop_uid(sop_instances[i])}, "
+                f"Instance Number {self._instance_number(sop_instances[i])}"
+                for i, d in shown
+            )
+            if len(offenders) > len(shown):
+                detail += f"\n  ... and {len(offenders) - len(shown)} more"
+            raise SliceGeometryError(
+                f"Rows (0028,0010) and Columns (0028,0011) are not consistent across the series: "
+                f"{len(offenders)} instance(s) differ from the first slice's "
+                f"{reference[0]}x{reference[1]}. All slices must share in-plane dimensions to stack "
+                f"into one volume.\n{detail}"
+            )
+
+        self._logger.debug(f"Rows/Columns consistent across {len(present)} instances: {reference[0]}x{reference[1]}")
+
+    def _analyze_instance_numbers(self, sop_instances) -> Optional[List[int]]:
+        """Logs Instance Number (0020,0013) coverage and returns the absent numbers.
+
+        For corroboration only; missing instances are determined from the slice positions alone,
+        in _classify_spacing and _analyze_slice_geometry. Instance Number (0020,0013) is Type 2 tag
+        and its definition does not promise contiguity, per-series scoping, or a particular start value,
+        so a gap in the numbering is not sufficient evidence of a loss.
+
+        Returns the Instance Numbers that fall inside the observed range but were not loaded, so
+        that _report_spacing can name them when it accepts or refuses a deficient series. Empty
+        when the numbering is continuous; None when it cannot say, because the tag is absent,
+        unusable or repeated, or missing from some instances. Note that instances missing from the
+        start or end of a series are invisible here and to every other check in this operator.
+        """
+        numbers = []
+        for sop_instance in sop_instances:
+            try:
+                value = sop_instance[0x0020, 0x0013].value
+            except (KeyError, TypeError):
+                continue
+            if value is None:
+                continue
+            try:
+                numbers.append(int(value))
+            except (TypeError, ValueError):
+                continue
+
+        if not numbers:
+            self._logger.debug("No usable Instance Number (0020,0013) values found")
+            return None
+
+        self._logger.debug(
+            f"Instance Number: {len(numbers)} of {len(sop_instances)} instances carry the tag; "
+            f"range {min(numbers)}..{max(numbers)}; in slice order {self._fmt_seq(numbers, '{:.0f}')}"
+        )
+
+        if len(numbers) < 2:
+            return None
+
+        # If there are untagged or repeated Instance Numbers, we cannot reliably determine missing slices
+        untagged = len(sop_instances) - len(numbers)
+        repeated = len(numbers) - len(set(numbers))
+        if untagged or repeated:
+            self._logger.debug(
+                f"Instance Number (0020,0013) cannot corroborate missing slices: {untagged} "
+                f"instance(s) without a usable value, {repeated} repeated value(s)"
+            )
+            return None
+
+        expected = max(numbers) - min(numbers) + 1
+        if expected == len(numbers):
+            return []
+
+        absent = sorted(set(range(min(numbers), max(numbers) + 1)) - set(numbers))
+        self._logger.warning(
+            f"Instance Number (0020,0013) ranges from {min(numbers)} to {max(numbers)}, "
+            f"implying {expected} instances, but {len(sop_instances)} were loaded. "
+            f"Instances may be missing from the series as delivered. "
+            f"Absent instance numbers: {self._fmt_seq(absent, '{:.0f}')}"
+        )
+        return absent
+
+    def _log_reference_spacing_tags(self, sop_instances) -> list:
+        """Logs SpacingBetweenSlices as declared and returns a sorted list of values.
+
+        Purely informational. SpacingBetweenSlices is not used in the construction of the
+        affine transformation, as this tag may be absent. SpacingBetweenSlices (spacing between
+        adjacent slices) is a Type 3 tag.
+        """
+        spacings = set()
+        for sop_instance in sop_instances:
+            spacing = self._get_tag_value(sop_instance, (0x0018, 0x0088))
+            if spacing:
+                spacings.add(round(float(spacing[0]), 6))
+        self._logger.debug(
+            f"Declared SpacingBetweenSlices (0018,0088) across the series: "
+            f"{sorted(spacings) if spacings else 'absent'}"
+        )
+        return sorted(spacings)
+
+    def _compare_against_declared_spacing(self, spacing: float, declared_spacing: list) -> None:
+        """Logs how the derived spacing compares with SpacingBetweenSlices."""
+
+        # More than one distinct value means the series disagrees with itself about its own
+        # through-plane geometry -- the same mixed-acquisition signal the orientation, Pixel
+        # Spacing and dimension checks look for. Not fatal: SpacingBetweenSlices is not used
+        # to build the affine, so the geometry stays sound, but the series is worth a look
+        if len(declared_spacing) > 1:
+            self._logger.warning(
+                f"(0018,0088) SpacingBetweenSlices is not consistent across the series: {len(declared_spacing)} "
+                f"distinct values {declared_spacing}. The series may combine more than one acquisition. "
+                f"Tag is not used to build the affine, so this does not affect the geometry, but the "
+                f"comparison is reported once per distinct value"
+            )
+
+        if declared_spacing:
+            for declared in declared_spacing:
+                delta = spacing - declared
+                percent = f"{100.0 * delta / declared:+.4f}%" if declared else "n/a (declared zero)"
+                self._logger.debug(
+                    f"Derived spacing {spacing:.6f} mm vs declared "
+                    f"SpacingBetweenSlices {declared:.6f} mm: difference {delta:+.6f} mm ({percent})"
+                )
+        else:
+            self._logger.debug(
+                f"SpacingBetweenSlices (0018,0088) is absent, so the derived spacing "
+                f"{spacing:.6f} mm cannot be cross-checked against the sender's claim"
+            )
+
+    def _log_slice_geometry_summary(self, normal, row_cosine, step_vector, depth, measured: bool = True) -> None:
+        """Logs how a series' slices sit in the patient, for every series that passes the geometry checks.
+        With one slice, the step and shear are reported as not measured.
+
+        Three independent quantities, each measured against a different reference:
+
+          obliquity          the slice normal against the nearest patient axis. How far the slice
+                             planes are tilted away from a true axial, coronal or sagittal
+                             acquisition. Determined via Image Orientation Patient.
+          in-plane rotation  the row cosine against that same axis set, after projecting the axis
+                             into the slice plane. Does not affect through-plane geometry. Determined
+                             via Image Orientation Patient.
+          shear              the origin-to-origin step against the slice normal. Whether the stack
+                             advances squarely through its planes or slides sideways as it goes.
+                             Determined via Image Orientation Patient and Image Position Patient.
+        """
+        n = np.asarray(normal, dtype=float)
+        n = n / np.linalg.norm(n)
+        axis_index = int(np.argmax(np.abs(n)))
+        axis = ("+" if n[axis_index] > 0 else "-") + "xyz"[axis_index]
+        obliquity = float(np.degrees(np.arccos(np.clip(abs(float(n[axis_index])), -1.0, 1.0))))
+
+        # Build an ORTHONORMAL in-plane reference frame before measuring. Projecting two patient
+        # axes into the slice plane does not keep them perpendicular once the plane is tilted --
+        # at 38.7 deg of obliquity they close to 80.4 deg -- so measuring against the nearer of
+        # the two raw projections makes the answer depend on whether the row or the column cosine
+        # was used. Orthonormalising first removes that: e1 is one patient axis projected in, and
+        # e2 completes the frame, so the row and column cosines then agree to float noise
+        other = [index for index in range(3) if index != axis_index]
+        e1 = np.eye(3)[other[0]] - float(np.dot(np.eye(3)[other[0]], n)) * n
+        e1 = e1 / np.linalg.norm(e1)
+        e2 = np.cross(n, e1)
+        r = np.asarray(row_cosine, dtype=float)
+        r = r / np.linalg.norm(r)
+        # fold into [0, 45] deg: the grid has four-fold symmetry, so a 90 deg turn is the same grid
+        raw_angle = float(np.degrees(np.arctan2(float(np.dot(r, e2)), float(np.dot(r, e1)))))
+        in_plane_rotation = abs((raw_angle + 45.0) % 90.0 - 45.0)
+
+        v = np.asarray(step_vector, dtype=float)
+        step_length = float(np.linalg.norm(v))
+        shear = float(np.linalg.norm(v - float(np.dot(n, v)) * n))
+        # Derived from the shear vector itself, so the angle and the millimetres cannot disagree
+        shear_angle = float(np.degrees(np.arctan2(shear, depth)))
+        percent = (100.0 * shear / depth) if depth else float("nan")
+
+        self._logger.info(f"Obliquity: slice planes are tilted away from the {axis} axis by {obliquity:.3f}°")
+        self._logger.info(f"In-Plane Rotation: pixel grid is turned within the plane by {in_plane_rotation:.3f}°")
+        if not measured:
+            self._logger.info("Origin-to-Origin Step: not measured, only one slice carries geometry")
+            self._logger.info("Shear: not measured, only one slice carries geometry")
+            self._logger.info(f"Depth Pixel Spacing: {depth:.6f} mm, the single-slice default")
+            return
+        self._logger.info(
+            f"Origin-to-Origin Step: {self._fmt_seq(v, '{:.6f}')}, Length: {step_length:.6f} mm. "
+            f"Moving from slice k origin --> slice k+1 origin"
+        )
+        self._logger.info(
+            f"Shear: origin-to-origin step leans off the normal by {shear_angle:.3f}° "
+            f"({shear:.6f} mm per slice, {percent:.2f}% of the spacing)"
+        )
+        self._logger.info(
+            f"Depth Pixel Spacing: perpendicular spacing between slice planes along the normal is {depth:.6f} mm"
+        )
+
+    def _classify_spacing(self, gaps: np.ndarray, spacing: float) -> Tuple[str, np.ndarray]:
+        """Classifies adjacent slice spacings and returns (state, outlier_indices).
+
+        Spacing classifications:
+
+        * ``uniform`` -- every gap matches the estimated spacing within tolerance.
+        * ``uniform_with_interior_gaps`` -- every interior gap is a whole multiple of the estimated spacing within
+          tolerance. Consistent with instances missing from an otherwise regular grid.
+        * ``irregular`` -- gaps are not whole multiples. No single spacing describes the series.
+        """
+        if spacing <= 0.0:
+            raise SliceGeometryError(
+                f"Base slice spacing estimated as {spacing:.9f} mm, which is not positive. "
+                f"Slice positions may be corrupt or all coincident"
+            )
+
+        multiples = gaps / spacing
+        uniform = np.isclose(multiples, 1.0, rtol=self.slice_spacing_rtol, atol=0.0)
+        integral = np.isclose(multiples, np.round(multiples), rtol=self.slice_spacing_rtol, atol=0.0)
+
+        self._logger.debug(
+            f"Gap multiples of base spacing {spacing:.6f} mm: "
+            f"{self._fmt_seq(multiples, '{:.4f}')}. "
+            f"Within tolerance of 1.0: {int(uniform.sum())}/{uniform.size}; "
+            f"whole multiples: {int(integral.sum())}/{integral.size}"
+        )
+
+        if uniform.all():
+            return self.SPACING_UNIFORM, np.array([], dtype=int)
+
+        outliers = np.nonzero(~uniform)[0]
+        if integral.all():
+            return self.SPACING_UNIFORM_WITH_INTERIOR_GAPS, outliers
+        return self.SPACING_IRREGULAR, outliers
+
+    @staticmethod
+    def _acquisition_number(sop_instance) -> int:
+        """Returns Acquisition Number (0020,0012) as an int, or -1 when it cannot be read.
+
+        Deliberately total: a malformed optional tag must not break duplicate resolution. Note
+        that ``Dataset.get`` returns the VALUE, so a default only applies when the tag is absent
+        entirely -- a tag present but empty or None still has to be handled here.
+        """
+        try:
+            native = sop_instance.get_native_sop_instance()
+            value = native.get("AcquisitionNumber", None)
+        except Exception:  # noqa: BLE001 - must never raise
+            return -1
+        if value is None:
+            return -1
+        if isinstance(value, str) and not value.strip():
+            return -1
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return -1
+
+    def _reject_duplicate_positions(self, sop_instances, positions) -> None:
+        """Raises if any two instances share a position along the slice normal.
+
+        Always fatal - two distinct instances at one position are, by construction, two
+        different volumes, and a 3D array has exactly one plane per position. Proceeding
+        would mean arbitrarily discarding one of the instances.
+
+        Nothing is pruned, so series._sop_instances, the positions and the IPPs cannot drift apart,
+        and _analyze_instance_numbers sees the series as delivered rather than reporting removed
+        duplicates as instances missing in transit.
+        """
+        gaps = np.diff(positions)
+        positive = gaps[gaps > 0.0]
+        scale = float(np.median(positive)) if positive.size else 1.0
+        atol = max(self.slice_spacing_rtol * scale, self.DUPLICATE_POSITION_ATOL_MM)
+        self._logger.debug(
+            f"Duplicate-position tolerance {atol:.9f} mm = max({self.slice_spacing_rtol} x "
+            f"median positive gap {scale:.6f} mm, floor {self.DUPLICATE_POSITION_ATOL_MM} mm)"
+        )
+
+        if not np.nonzero(gaps <= atol)[0].size:
+            self._logger.debug("No duplicate slice positions detected")
+            return
+
+        # Group runs of coincident positions
+        groups: List[List[int]] = []
+        start = 0
+        for i in range(gaps.size):
+            if gaps[i] > atol:
+                groups.append(list(range(start, i + 1)))
+                start = i + 1
+        groups.append(list(range(start, positions.size)))
+        collided = [g for g in groups if len(g) > 1]
+
+        surplus = sum(len(g) - 1 for g in collided)
+        size_counts = sorted(collections.Counter(len(g) for g in collided).items())
+        shape = ", ".join(f"{count} position(s) shared by {size} instances" for size, count in size_counts)
+
+        # Summary
+        shown = collided[: self.DUPLICATE_REPORT_LIMIT]
+        detail = "\n".join(
+            f"  Image Position Patient "
+            f"{[self._get_tag_value(sop_instances[i], (0x0020, 0x0032)) for i in g]}: "
+            f"{len(g)} instances at array indices {[int(i) for i in g]}, Acquisition Numbers "
+            f"{[self._acquisition_number(sop_instances[i]) for i in g]}, "
+            f"SOP Instance UIDs {[self._sop_uid(sop_instances[i]) for i in g]}"
+            for g in shown
+        )
+        if len(collided) > len(shown):
+            detail += f"\n  ... and {len(collided) - len(shown)} further position(s) not listed"
+
+        raise SliceGeometryError(
+            f"{len(collided)} position(s) along the slice normal carry more than one instance "
+            f"({shape}), {surplus} instance(s) more than the {positions.size - surplus} distinct "
+            f"positions can hold. A 3D volume has one plane per position, so this series cannot be "
+            f"built without arbitrarily discarding instances, and nothing here can say which\n{detail}\n"
+            f"If the Acquisition Numbers differ, the series may concatenate more than one acquisition. "
+            f"If they are identical, the instances may be repeated exposures, or echoes or phases "
+            f"of one acquisition"
+        )
+
+    def _analyze_slice_geometry(self, series) -> Dict:
+        """Computes slice ordering, spacing and the inter-slice step vector for a series.
+
+        Order of operations:
+        1. Remove instances that lack Image Orientation Patient or Image Position Patient (absent
+           or zero-length); refuse the series if either tag is present but unparsable, short,
+           or carries a NaN or infinite value
+        2. Refuse the series unless Image Orientation Patient, Pixel Spacing and Rows/Columns
+           are consistent across every remaining instance
+        3. Derive the slice normal from the first remaining instance (raw cosines used)
+        4. Read and log SpacingBetweenSlices as declared
+        5. Order the remaining instances by projection onto the slice normal
+        6. Raise if two instances share a position
+        7. Write `.distance` onto each instance and set series.depth_direction_cosine
+        8. Report Instance Number coverage if present, and collect the numbers absent in transit
+        9. Estimate the base spacing: median seed, then the mean of the gaps within
+           slice_spacing_rtol of it
+        10. Measure each slice's residual from the grid that spacing implies
+        11. Classify spacing as uniform, uniform_with_interior_gaps or irregular
+        12. Average the same inlier gaps as vectors to get the inter-slice step, preserving any
+            in-plane shear, and project it onto the normal to get depth_pixel_spacing
+
+        Acceptance is not decided here: this method measures and classifies, and _report_spacing
+        applies the policy to what it returns.
+        """
+        sop_instances = series._sop_instances
+
+        # Gather and validate per-instance geometry
+        iop_list: List[list] = []
+        ipp_list: List[list] = []
+        ps_list: List[Optional[list]] = []
+        dim_list: List[Optional[Tuple[int, int]]] = []
+        keep: List[int] = []
+        entry_count = len(sop_instances)
+        removal_states: List[Tuple[str, str]] = []
+        for index, sop_instance in enumerate(sop_instances):
+            iop = self._get_tag_value(sop_instance, (0x0020, 0x0037))
+            ipp = self._get_tag_value(sop_instance, (0x0020, 0x0032))
+            if iop is None or len(iop) < 6 or ipp is None or len(ipp) < 3:
+                iop_state, iop_raw = self._tag_state(sop_instance, (0x0020, 0x0037), 6)
+                ipp_state, ipp_raw = self._tag_state(sop_instance, (0x0020, 0x0032), 3)
+                # Removal is for instances that carry no plane, e.g. non-image objects filed in
+                # the series, so only an absent or zero-length tag qualifies. A value that is
+                # present but unparsable, short, or NaN/infinite is a corrupt header, not a missing
+                # one: removing it would drop a real plane, invisibly if it sat at either end of the
+                # stack, and leave a single-plane volume if it hit all but one instance
+                if any(state not in ("absent", "empty", "ok") for state in (iop_state, ipp_state)):
+                    raise SliceGeometryError(
+                        f"Instance at index {index} carries a present but unusable geometry "
+                        f"value: Image Orientation Patient (0020,0037) {iop_state}, Image Position "
+                        f"Patient (0020,0032) {ipp_state}. IOP={iop_raw}, IPP={ipp_raw}, "
+                        f"SOP Instance UID {self._sop_uid(sop_instance)}, "
+                        f"Instance Number {self._instance_number(sop_instance)}"
+                    )
+                removal_states.append((iop_state, ipp_state))
+                self._logger.warning(
+                    f"Removing instance at index {index}: Image Orientation Patient (0020,0037) "
+                    f"{iop_state}, Image Position Patient (0020,0032) {ipp_state}. "
+                    f"IOP={iop_raw}, IPP={ipp_raw}, SOP Instance UID {self._sop_uid(sop_instance)}"
+                )
+                continue
+            iop_list.append(iop)
+            ipp_list.append(ipp)
+            ps_list.append(self._get_tag_value(sop_instance, (0x0028, 0x0030)))
+            rows = self._get_tag_value(sop_instance, (0x0028, 0x0010))
+            cols = self._get_tag_value(sop_instance, (0x0028, 0x0011))
+            dim_list.append((int(rows[0]), int(cols[0])) if rows and cols else None)
+            keep.append(index)
+
+        if len(keep) != len(sop_instances):
+            self._logger.info(
+                f"Removed {len(sop_instances) - len(keep)} instance(s) lacking usable geometry; {len(keep)} remain"
+            )
+            series._sop_instances = [sop_instances[i] for i in keep]
+            sop_instances = series._sop_instances
+
+        if len(sop_instances) < 1:
+            if all(states == ("absent", "absent") for states in removal_states):
+                raise SliceGeometryError(
+                    f"None of the {entry_count} instances in this series carries Image Orientation "
+                    f"Patient (0020,0037) or Image Position Patient (0020,0032) tags"
+                )
+            raise SliceGeometryError(
+                f"None of the {entry_count} instances in this series carries usable Image "
+                f"Orientation Patient and Image Position Patient tags, and at least one carries a tag "
+                f"that is present but unusable; a volume cannot be constructed. The removal "
+                f"warnings above give the state of each tag"
+            )
+
+        # Check orientation, in-plane spacing, and in-plane dimensions are consistent across the series
+        self._validate_orientation_consistency(iop_list)
+        self._validate_pixel_spacing_consistency(ps_list, sop_instances)
+        self._validate_dimensions_consistency(dim_list, sop_instances)
+        normal = self._slice_normal(iop_list[0])
+
+        # Grab and SpacingBetweenSlices
+        declared_spacing = self._log_reference_spacing_tags(sop_instances)
+
+        # Order by projection onto the slice normal
+        positions = np.array([float(np.dot(normal, np.asarray(p, dtype=float))) for p in ipp_list])
+        self._logger.debug(f"Projections before sorting: {self._fmt_seq(positions)}")
+
+        order = np.argsort(positions, kind="stable")
+
+        series._sop_instances = [sop_instances[i] for i in order]
+        sop_instances = series._sop_instances
+        positions = positions[order]
+        ipp_sorted = [np.asarray(ipp_list[i], dtype=float) for i in order]
+
+        # Raise error if duplicate positions detected
+        if len(sop_instances) > 1:
+            self._reject_duplicate_positions(sop_instances, positions)
+
+        self._logger.debug(f"Projections after sorting: {self._fmt_seq(positions)}")
+        self._logger.debug(
+            f"First slice IPP: {self._fmt_seq(ipp_sorted[0], '{:.6g}')}; "
+            f"Last slice IPP: {self._fmt_seq(ipp_sorted[-1], '{:.6g}')}; "
+            f"Span={positions[-1] - positions[0]:.4f} mm"
+        )
+
+        # Record ordering onto the surviving instances
+        for sop_instance, position in zip(sop_instances, positions):
+            sop_instance.distance = float(position)
+
+        # `+ 0.0` maps -0.0 to 0.0. A cross product with a zero component yields negative
+        # zero for half the orientations, which is arithmetically identical but serialises
+        # as "-0.0" into the Image metadata and into anything written from it
+        series.depth_direction_cosine = [float(v) + 0.0 for v in normal]
+        absent_instance_numbers = self._analyze_instance_numbers(sop_instances)
+
+        # single instance cases after filtering out unusable geometries
+        if len(sop_instances) < 2:
+            self._logger.warning(
+                f"Only {len(sop_instances)} instance(s) in this series carry usable geometry, so no "
+                f"slice spacing can be measured and depth_pixel_spacing falls back to the "
+                f"{self.DEFAULT_DEPTH_PIXEL_SPACING} mm default. The series was delivered with more "
+                f"than one instance, so the others were removed for absent or unusable Image Orientation "
+                f"Patient or Image Position Patient values. The volume is a single plane and its "
+                f"through-plane spacing is a convention, not a measurement"
+            )
+            # The 1.0 mm is a convention, not a measurement, so the step is built from the unit
+            # normal to keep |col2| at exactly that convention, and depth is the projection onto
+            # the raw normal as in the multi-slice path. Using the raw normal for both would make
+            # depth |n|^2 mm and fail invariants 1 and 2 by twice the cosines' rounding
+            unit_step = (normal / float(np.linalg.norm(normal))) * self.DEFAULT_DEPTH_PIXEL_SPACING
+            return {
+                "normal": normal,
+                "row_cosine": iop_list[0][0:3],
+                "positions": positions,
+                "step_vector": unit_step,
+                "depth_pixel_spacing": float(np.dot(normal, unit_step)),
+                "regularity": self.SPACING_UNIFORM,
+                "outlier_indices": np.array([], dtype=int),
+                "gaps": np.array([]),
+                "missing_slice_count": 0,
+                "expected_slice_count": int(positions.size),
+                "max_grid_residual": 0.0,
+                "absent_instance_numbers": absent_instance_numbers,
+                "ipp_sorted": ipp_sorted,
+                "measured": False,
+            }
+
+        gaps = np.diff(positions)
+        if gaps.size < 1:
+            raise SliceGeometryError("Fewer than two distinct slice positions remain; cannot define a volume")
+
+        # Slice spacing analysis
+        unique_gaps, gap_counts = np.unique(np.round(gaps, 6), return_counts=True)
+        self._logger.debug(
+            f"{gaps.size} adjacent gaps; distinct values (6 dp): "
+            + ", ".join(f"{g:.6f} mm x{c}" for g, c in zip(unique_gaps, gap_counts))
+        )
+        self._logger.debug(
+            f"Gap statistics: min={float(gaps.min()):.6f} mm, max={float(gaps.max()):.6f} mm , "
+            f"median={float(np.median(gaps)):.6f} mm, mean={float(gaps.mean()):.6f} mm, "
+            f"std={float(gaps.std()):.3e} mm"
+        )
+
+        # DPS declaration - median first, then inlier mean of the gaps within tolerance of it
+        # Median is immune to outlier gaps but inherits the float noise of a single observation;
+        # averaging the inliers cancels that noise while staying robust
+        spacing_seed = float(np.median(gaps))
+        inlier_mask = np.isclose(gaps, spacing_seed, rtol=self.slice_spacing_rtol, atol=0.0)
+        if not inlier_mask.any():
+            self._logger.debug(
+                f"No gap lies within {self.slice_spacing_rtol} of the median {spacing_seed:.9f} mm; "
+                f"falling back to the median itself as the base spacing"
+            )
+            inlier_mask = np.isclose(gaps, spacing_seed, rtol=0.0, atol=np.inf)
+        spacing = float(gaps[inlier_mask].mean())
+
+        end_to_end_mean = float((positions[-1] - positions[0]) / (positions.size - 1))
+        self._logger.debug(
+            f"Spacing estimates: median seed={spacing_seed:.9f} mm, "
+            f"inlier mean ({int(inlier_mask.sum())}/{inlier_mask.size} gaps)={spacing:.9f} mm, "
+            f"end-to-end mean={end_to_end_mean:.9f} mm "
+            f"(inflation {100.0 * (end_to_end_mean / spacing - 1.0):+.4f}% vs the value used), "
+            f"first adjacent pair={float(gaps[0]):.9f} mm, "
+            f"minimum gap={float(gaps.min()):.9f} mm"
+        )
+
+        # Compare derived spacings against DICOM tag values
+        self._compare_against_declared_spacing(spacing, declared_spacing)
+
+        # Compute residuals of each slice position relative to the ideal grid defined by base spacing
+        # Similar to highdicom's "every position is a whole multiple of the base" check
+        offsets = positions - positions[0]
+        grid_indices = np.round(offsets / spacing)
+        grid_residuals = np.abs(offsets - grid_indices * spacing)
+        max_grid_residual = float(grid_residuals.max())
+        if max_grid_residual == 0.0:
+            self._logger.debug(
+                f"Grid residual: all slices lie on the grid (residual 0); "
+                f"tolerance {self.grid_residual_rtol} x {spacing:.6f} = "
+                f"{self.grid_residual_rtol * spacing:.9f} mm"
+            )
+        else:
+            worst_index = int(np.argmax(grid_residuals))
+            self._logger.debug(
+                f"Grid residual: worst slice is array index {worst_index}, "
+                f"{max_grid_residual:.9f} mm ({max_grid_residual / spacing:.3e} of the base spacing) "
+                f"from grid position {int(grid_indices[worst_index])}; "
+                f"tolerance {self.grid_residual_rtol} x {spacing:.6f} = "
+                f"{self.grid_residual_rtol * spacing:.9f} mm"
+            )
+
+        # Classify series spacing regularity and identify outliers
+        regularity, outlier_indices = self._classify_spacing(gaps, spacing)
+
+        # --- the step vector, preserving in-plane shear -------------------------------
+        # The affine's third column is the vector from one slice origin to the next, not a scalar
+        # along the normal. Under gantry tilt the two differ: the stack advances along the table
+        # while the slice planes are tilted, so the step has an in-plane component. Averaging the
+        # same inliers keeps that component while rejecting the gaps that span missing instances
+        step_vectors = np.diff(np.stack(ipp_sorted, axis=0), axis=0)
+        step_vector = step_vectors[inlier_mask].mean(axis=0)
+
+        depth_pixel_spacing = float(np.dot(normal, step_vector))
+
+        self._logger.debug(
+            f"Step vector is the mean of the {int(inlier_mask.sum())} inlier gaps; scalar/vector "
+            f"consistency (normal . mean step) - (mean of normal . step) = "
+            f"{depth_pixel_spacing - spacing:+.3e} mm (must be float noise)"
+        )
+
+        if depth_pixel_spacing <= 0.0:
+            raise SliceGeometryError(
+                f"Computed a non-positive depth pixel spacing ({depth_pixel_spacing:.6f} mm) after sorting. "
+                f"Slice positions may be corrupt"
+            )
+
+        # How far the affine's linear model lands from the last slice's actual position. Zero for
+        # a uniform series; one base spacing per missing instance when gaps are present, since the
+        # model advances by the base spacing per index and the real stack skipped positions
+        modelled_last = ipp_sorted[0] + (len(ipp_sorted) - 1) * step_vector
+        residual = float(np.linalg.norm(modelled_last - ipp_sorted[-1]))
+        self._logger.debug(
+            f"Step model check: last slice predicted at "
+            f"{self._fmt_seq(modelled_last, '{:.4f}')}, actual {self._fmt_seq(ipp_sorted[-1], '{:.4f}')}, "
+            f"residual {residual:.6f} mm"
+        )
+
+        # Missing instances
+        missing_slice_count = 0
+        if outlier_indices.size:
+            multiples = np.round(gaps[outlier_indices] / spacing)
+            missing_slice_count = int(max(0, int(np.sum(multiples - 1.0))))
+
+        expected_slice_count = int(positions.size + missing_slice_count)
+
+        return {
+            "normal": normal,
+            "row_cosine": iop_list[0][0:3],
+            "positions": positions,
+            "step_vector": step_vector,
+            "depth_pixel_spacing": depth_pixel_spacing,
+            "regularity": regularity,
+            "outlier_indices": outlier_indices,
+            "gaps": gaps,
+            "missing_slice_count": missing_slice_count,
+            "expected_slice_count": expected_slice_count,
+            "max_grid_residual": max_grid_residual,
+            "absent_instance_numbers": absent_instance_numbers,
+            "ipp_sorted": ipp_sorted,
+        }
+
+    def _report_spacing(self, series, geometry: Dict) -> None:
+        """Logs the spacing regularity and refuses any series that is not a complete grid.
+
+        A volume is produced only when the present slices form a complete, uniformly spaced grid.
+        The gate runs in a fixed order, most diagnostic first, so that a series failing several
+        checks is reported by its root cause:
+
+            1. irregular spacing - no single base spacing describes the series
+            2. grid residual - the positions drift off the grid cumulatively
+            3. uniform with interior gaps - interior instances are absent from an otherwise uniform grid
+            4. uniform
+
+        Logs the following diagnostics:
+            slice_spacing_regularity: one of uniform | uniform_with_interior_gaps | irregular
+            missing_slice_count: number of grid positions with no instance
+            expected_slice_count: planes the volume would have if it were padded to the grid
+                                  Equal to the plane count when the series is uniform
+            slice_spacing_outliers: list of (index, gap_mm, position_before_mm, position_after_mm)
+                                  where index is the ARRAY index of the slice BEFORE the gap, so the
+                                  gap lies between indices index and index + 1 -- adjacent in the
+                                  volume but not in the patient
+            max_grid_residual_mm: worst distance of any slice from the regular grid
+        """
+        regularity = geometry["regularity"]
+        spacing = geometry["depth_pixel_spacing"]
+        gaps = geometry["gaps"]
+        outliers = geometry["outlier_indices"]
+        positions = geometry["positions"]
+        missing = geometry["missing_slice_count"]
+        residual = geometry["max_grid_residual"]
+        absent_numbers = geometry["absent_instance_numbers"]
+
+        slice_spacing_outliers = [
+            (int(i), float(gaps[i]), float(positions[i]), float(positions[i + 1])) for i in outliers
+        ]
+        self._logger.debug(
+            f"Slice geometry diagnostics: slice_spacing_regularity={regularity}, "
+            f"missing_slice_count={missing}, expected_slice_count={geometry['expected_slice_count']}, "
+            f"max_grid_residual_mm={float(residual):.9f}, "
+            f"slice_spacing_outliers (each tuple = array index before the gap, gap mm, "
+            f"position before mm, position after mm)={slice_spacing_outliers}"
+        )
+
+        detail = "\n".join(
+            f"  gap {int(i)} -> {int(i) + 1}: {float(gaps[i]):.6f} mm "
+            f"({float(gaps[i]) / spacing:.3f} x base) between positions "
+            f"{float(positions[i]):.4f} and {float(positions[i + 1]):.4f} mm along the normal"
+            for i in outliers
+        )
+        if absent_numbers is None:
+            corroboration = (
+                "\nInstance Number (0020,0013) is absent, repeated, or not carried by every "
+                "instance, so it cannot be used to corroborate spacing regularity."
+            )
+        elif absent_numbers:
+            corroboration = (
+                f"\nInstance Numbers absent from the series as delivered: "
+                f"{self._fmt_seq(absent_numbers, '{:.0f}')}. May be consistent with instances dropped "
+                f"in transit rather than a non-uniform acquisition, though not proof of it: Instance "
+                f"Numbers are not required to be contiguous."
+            )
+        else:
+            corroboration = "\nInstance Numbers are continuous. Gaps may be due to a non-uniform acquisition."
+
+        # Irregular spacing
+        if regularity == self.SPACING_IRREGULAR:
+            raise SliceGeometryError(
+                f"Slice spacing is irregular: gaps are not whole multiples of the estimated base "
+                f"spacing {spacing:.6f} mm.\n{detail}{corroboration}\n"
+                f"The series cannot be represented as a regularly sampled volume"
+            )
+
+        # Grid residual check
+        residual_limit = self.grid_residual_rtol * spacing
+        if residual > residual_limit:
+            raise SliceGeometryError(
+                f"Slice positions drift off the regular grid: the worst slice sits "
+                f"{residual:.6f} mm from its grid position, above the limit of "
+                f"{residual_limit:.6f} mm ({self.grid_residual_rtol} x the {spacing:.6f} mm base "
+                f"spacing). Each individual gap may still be within {self.slice_spacing_rtol} of "
+                f"the base -- that is a pairwise test and this is the cumulative one.\n"
+                f"Raise grid_residual_rtol to accept this series, or treat the positions as "
+                f"unreliable"
+            )
+
+        # Regular spacing with interior gaps
+        if regularity == self.SPACING_UNIFORM_WITH_INTERIOR_GAPS:
+            raise SliceGeometryError(
+                f"Slice spacing is uniform with interior gaps: base spacing {spacing:.6f} mm, "
+                f"{outliers.size} gap(s) that are whole multiples of it, implying "
+                f"{missing} missing instance(s) across {positions.size} present slices "
+                f"({geometry['expected_slice_count']} grid positions).\n{detail}{corroboration}\n"
+            )
+
+        # Uniform spacing
+        if regularity == self.SPACING_UNIFORM:
+            self._logger.debug(
+                f"Slice spacing is uniform: {spacing:.6f} mm across {positions.size} slices "
+                f"(worst grid residual {residual:.6f} mm)"
+            )
+            return
+
+    def prepare_series(self, series) -> None:
+        """Orders the slices of a series and derives its depth pixel spacing and affine transforms.
+
+        Each slice's position is projected onto the slice normal, giving a signed distance from
+        the patient coordinate origin. Slices are ordered by that distance. The adjacent
+        distances then yield both the depth pixel spacing and the inter-slice step vector used to
+        build the affine.
 
         Args:
             series: An instance of DICOMSeries.
         """
+        if not series._sop_instances:
+            raise SliceGeometryError("The series contains no SOP instances")
 
+        # Refuse multi-frame instances (e.g. Enhanced CT/MR)
+        for index, sop_instance in enumerate(series._sop_instances):
+            frames = self._get_tag_value(sop_instance, (0x0028, 0x0008))
+            if frames is not None and len(frames) >= 1 and int(frames[0]) > 1:
+                raise SliceGeometryError(
+                    f"Instance at index {index} carries {int(frames[0])} frames (Number of Frames "
+                    f"(0028,0008)). Multi-frame instances keep per-frame geometry in the functional "
+                    f"group sequences, which this operator does not read; convert to single-frame "
+                    f"instances before this operator. SOP Instance UID {self._sop_uid(sop_instance)}"
+                )
+
+        # Single-instance series (e.g. CR)
         if len(series._sop_instances) <= 1:
-            series.depth_pixel_spacing = 1.0  # Default to 1, e.g. for CR image, similar to (Simple) ITK
+            self._prepare_single_instance_series(series)
             return
 
-        slice_indices_to_be_removed = []
-        last_slice_normal = [0.0, 0.0, 0.0]
+        # Detect non-images + duplicate positions, order by slice normal projection
+        geometry = self._analyze_slice_geometry(series)
 
-        for slice_index, slice in enumerate(series._sop_instances):
-            distance = 0.0
-            point = [0.0, 0.0, 0.0]
-            slice_normal = [0.0, 0.0, 0.0]
-            slice_position = None
-            cosines = None
+        # Classify spacing, enforce non-uniformity constraints
+        self._report_spacing(series, geometry)
+        series.depth_pixel_spacing = geometry["depth_pixel_spacing"]
 
-            try:
-                image_orientation_patient_de = slice[0x0020, 0x0037]
-                if image_orientation_patient_de is not None:
-                    image_orientation_patient = image_orientation_patient_de.value
-                    cosines = image_orientation_patient
-            except KeyError:
-                pass
+        # Slice geometry summary
+        self._log_slice_geometry_summary(
+            geometry["normal"],
+            geometry["row_cosine"],
+            geometry["step_vector"],
+            series.depth_pixel_spacing,
+            measured=geometry.get("measured", True),
+        )
 
-            try:
-                image_poisition_patient_de = slice[0x0020, 0x0032]
-                if image_poisition_patient_de is not None:
-                    image_poisition_patient = image_poisition_patient_de.value
-                    slice_position = image_poisition_patient
-            except KeyError:
-                pass
+        # Compute affine in DICOM and NIfTI coordinate systems
+        self.compute_affine_transform(series._sop_instances[0], geometry["step_vector"], series)
+        self.verify_affine_invariants(series)
 
-            distance = 0.0
+    def _prepare_single_instance_series(self, series) -> None:
+        """Handles a series of one instance, e.g. CR, where no spacing can be derived."""
+        self._logger.info(
+            f"Single-instance series; depth pixel spacing defaults to {self.DEFAULT_DEPTH_PIXEL_SPACING} mm"
+        )
+        series.depth_pixel_spacing = self.DEFAULT_DEPTH_PIXEL_SPACING
+        self._logger.debug(
+            f"Slice geometry diagnostics: slice_spacing_regularity={self.SPACING_UNIFORM}, "
+            f"missing_slice_count=0, expected_slice_count=1, slice_spacing_outliers=[], "
+            f"max_grid_residual_mm=0.0"
+        )
 
-            if (cosines is not None) and (slice_position is not None):
-                slice_normal[0] = cosines[1] * cosines[5] - cosines[2] * cosines[4]
-                slice_normal[1] = cosines[2] * cosines[3] - cosines[0] * cosines[5]
-                slice_normal[2] = cosines[0] * cosines[4] - cosines[1] * cosines[3]
+        sop_instance = series._sop_instances[0]
+        iop = self._get_tag_value(sop_instance, (0x0020, 0x0037))
+        ipp = self._get_tag_value(sop_instance, (0x0020, 0x0032))
 
-                last_slice_normal = copy.deepcopy(slice_normal)
-
-                i = 0
-                while i < 3:
-                    point[i] = slice_normal[i] * slice_position[i]
-                    i += 1
-
-                distance += point[0] + point[1] + point[2]
-
-                series._sop_instances[slice_index].distance = distance
-                series._sop_instances[slice_index].first_pixel_on_slice_normal = point
+        if iop is None or len(iop) < 6:
+            iop_state, iop_raw = self._tag_state(sop_instance, (0x0020, 0x0037), 6)
+            if iop_state == "non-finite":
+                raise SliceGeometryError(
+                    f"Single-instance series has a non-finite (NaN or infinite) Image Orientation "
+                    f"Patient (0020,0037): {iop_raw}. SOP Instance UID {self._sop_uid(sop_instance)}"
+                )
+            if iop_state == "absent":
+                self._logger.info(
+                    f"Single-instance series carries no Image Orientation Patient (0020,0037); "
+                    f"no slice normal and no affine transform are computed. "
+                    f"SOP Instance UID {self._sop_uid(sop_instance)}"
+                )
             else:
-                logging.debug(f"Slice index to remove: {slice_index}")
-                slice_indices_to_be_removed.append(slice_index)
+                self._logger.warning(
+                    f"Single-instance series has an unusable Image Orientation Patient (0020,0037) "
+                    f"value ({iop_state}); no slice normal and no affine transform are computed. "
+                    f"IOP={iop_raw}, SOP Instance UID {self._sop_uid(sop_instance)}"
+                )
+            return
 
-        logging.debug(f"Total slices before removal (if applicable): {len(series._sop_instances)}")
+        normal = self._slice_normal(iop)
 
-        # iterate in reverse order to avoid affecting subsequent indices after a deletion
-        for sl_index in sorted(slice_indices_to_be_removed, reverse=True):
-            del series._sop_instances[sl_index]
-            logging.info(f"Removed slice index: {sl_index}")
+        # `+ 0.0` maps -0.0 to 0.0. A cross product with a zero component yields negative
+        # zero for half the orientations, which is arithmetically identical but serialises
+        # as "-0.0" into the Image metadata and into anything written from it
+        series.depth_direction_cosine = [float(v) + 0.0 for v in normal]
 
-        logging.debug(f"Total slices after removal (if applicable): {len(series._sop_instances)}")
+        if ipp is not None and len(ipp) >= 3:
+            position = float(np.dot(normal, np.asarray(ipp[:3], dtype=float)))
+            sop_instance.distance = position
+            self._logger.debug(f"Single instance at {position:.6f} mm along the normal")
+        else:
+            ipp_state, ipp_raw = self._tag_state(sop_instance, (0x0020, 0x0032), 3)
+            if ipp_state == "non-finite":
+                raise SliceGeometryError(
+                    f"Single-instance series has a non-finite (NaN or infinite) Image Position "
+                    f"Patient (0020,0032): {ipp_raw}. SOP Instance UID {self._sop_uid(sop_instance)}"
+                )
+            if ipp_state == "absent":
+                self._logger.info(
+                    f"Single-instance series carries Image Orientation Patient but no Image Position "
+                    f"Patient (0020,0032); no affine transform is computed. "
+                    f"SOP Instance UID {self._sop_uid(sop_instance)}"
+                )
+            else:
+                self._logger.warning(
+                    f"Single-instance series has an unusable Image Position Patient (0020,0032) "
+                    f"value ({ipp_state}); no affine transform is computed. IPP={ipp_raw}, "
+                    f"SOP Instance UID {self._sop_uid(sop_instance)}"
+                )
+            return
 
-        series._sop_instances = sorted(series._sop_instances, key=lambda s: s.distance)
-        series.depth_direction_cosine = copy.deepcopy(last_slice_normal)
+        unit_step = (normal / float(np.linalg.norm(normal))) * self.DEFAULT_DEPTH_PIXEL_SPACING
+        series.depth_pixel_spacing = float(np.dot(normal, unit_step))
 
-        if len(series._sop_instances) > 1:
-            # Depth spacing is the difference of the two slice origins' scalar projections
-            # onto the unit slice normal, dot(n, p) — already computed into .distance above
-            d1 = series._sop_instances[0].distance
-            d2 = series._sop_instances[1].distance
-            series.depth_pixel_spacing = abs(d2 - d1)
+        # Slice geometry summary
+        self._log_slice_geometry_summary(normal, iop[0:3], unit_step, series.depth_pixel_spacing, measured=False)
 
-            logging.debug(f"Slice normal projections, first two instances: {d1} & {d2}")
-            logging.debug(f"Depth pixel spacing: {series.depth_pixel_spacing:.6f} mm ")
+        # Compute affine in DICOM and NIfTI coordinate systems
+        self.compute_affine_transform(sop_instance, unit_step, series)
+        self.verify_affine_invariants(series)
 
-        s_1 = series._sop_instances[0]
-        s_n = series._sop_instances[-1]
-        num_slices = len(series._sop_instances)
-        self.compute_affine_transform(s_1, s_n, num_slices, series)
-
-    def compute_affine_transform(self, s_1, s_n, n, series):
-        """Computes the affine transform for this series. It does it in both DICOM Patient oriented
-        coordinate system as well as the pne preferred by NIFTI standard. Accordingly, the two attributes
+    def compute_affine_transform(self, s_1, step_vector, series):
+        """Computes the affine transform for this series. It does it in both DICOM patient oriented
+        coordinate system as well as the one preferred by NIFTI standard. Accordingly, the two attributes
         dicom_affine_transform and nifti_affine_transform are stored in the series instance.
 
         The Image Orientation Patient contains two triplets, [rx ry rz cx cy cz], which encode
-        direction cosines of the row and column of an image slice. The Image Position Patient of the first slice in
-        a volume, [x1 y1 z1], is the x, y, z coordinates of the upper-left corner voxel of the slice. These two
-        parameters define the location of the slice in PCS. To determine the location of a volume, the Image
-        Position Patient of another slice is normally needed. In practice, we tend to use the position of the last
-        slice in a volume, [xn yn zn]. The voxel size within the slice plane, [vr vc], is stored in object Pixel Spacing.
+        direction cosines of the row and column of an image slice. The Image Position Patient of the first
+        slice in a volume, [x1 y1 z1], is the x, y, z coordinates of the centre of the first voxel transmitted.
+        These two parameters define the location of the slice in PCS. To determine the location of a volume,
+        the Image Position Patient of each slice is needed to determine the relative positions of the slices
+        within the volume.
+
+        To fully specify the slice geometry, one also needs the in-plane Pixel Spacing and the inter-slice step
+        vector - these define the mapping from voxel indices to patient coordinates.
+
+        The third column is the step vector itself rather than a scalar spacing times the slice
+        normal, so that an acquisition whose slices advance at an angle to their own normal
+        (i.e., gantry tilt) keeps its in-plane shear. `series.depth_pixel_spacing` is the projection of this
+        same vector onto the slice normal as transmitted -- not rescaled to unit length, so that
+
+            |det(m[:3, :3])| == row_axis_spacing * col_axis_spacing * depth_pixel_spacing
+
+        stays exact for every orientation. Note that this invariant is symmetric in the two in-plane
+        spacings and so cannot detect a transposed pairing. PixelSpacing[0] is the spacing between rows
+        (it scales the column cosine) and PixelSpacing[1] between columns (it scales the row cosine);
+        verify_affine_invariants checks 3 and 4 catch a swap.
 
         Args:
-            s_1: A first slice in the series.
-            s_n: A last slice in the series.
-            n: A number of slices in the series.
+            s_1: The first slice in the ordered series.
+            step_vector: The 3-vector from one slice origin to the next, in patient coordinates.
             series: An instance of DICOMSeries.
         """
 
-        m1 = np.arange(1, 17, dtype=float).reshape(4, 4)
-        m2 = np.arange(1, 17, dtype=float).reshape(4, 4)
+        image_orientation_patient = self._get_tag_value(s_1, (0x0020, 0x0037))
+        if image_orientation_patient is None or len(image_orientation_patient) < 6:
+            raise SliceGeometryError(
+                "Image Orientation Patient (0020,0037) is missing or malformed on the first slice; "
+                "the affine transform cannot be computed"
+            )
 
-        image_orientation_patient = None
-        try:
-            image_orientation_patient_de = s_1[0x0020, 0x0037]
-            if image_orientation_patient_de is not None:
-                image_orientation_patient = image_orientation_patient_de.value
-        except KeyError:
-            pass
-        rx = image_orientation_patient[0]
-        ry = image_orientation_patient[1]
-        rz = image_orientation_patient[2]
-        cx = image_orientation_patient[3]
-        cy = image_orientation_patient[4]
-        cz = image_orientation_patient[5]
+        row_cosine_raw = np.asarray(image_orientation_patient[0:3], dtype=float)
+        col_cosine_raw = np.asarray(image_orientation_patient[3:6], dtype=float)
+        row_norm = float(np.linalg.norm(row_cosine_raw))
+        col_norm = float(np.linalg.norm(col_cosine_raw))
+        if row_norm <= 0.0 or col_norm <= 0.0:
+            raise SliceGeometryError(
+                f"Image Orientation Patient (0020,0037) contains a zero-length direction cosine "
+                f"on the first slice: row {list(row_cosine_raw)}, column {list(col_cosine_raw)}"
+            )
+        rx, ry, rz = (float(v) for v in row_cosine_raw)
+        cx, cy, cz = (float(v) for v in col_cosine_raw)
 
-        vr = 0.0
-        vc = 0.0
-        try:
-            pixel_spacing_de = s_1[0x0028, 0x0030]
-            if pixel_spacing_de is not None:
-                vr = pixel_spacing_de.value[0]
-                vc = pixel_spacing_de.value[1]
-        except KeyError:
-            pass
+        # Check direction cosine normals against the expected unit length
+        worst_norm_error = max(abs(row_norm - 1.0), abs(col_norm - 1.0))
+        if worst_norm_error > self.COSINE_NORM_RAISE_ATOL:
+            raise SliceGeometryError(
+                f"Image Orientation Patient direction cosines are not unit length as transmitted: "
+                f"|r| = {row_norm:.12f}, |c| = {col_norm:.12f} (deviation {worst_norm_error:.3e}, "
+                f"limit {self.COSINE_NORM_RAISE_ATOL})"
+            )
+        if worst_norm_error > self.COSINE_NORM_ATOL:
+            self._logger.warning(
+                f"Image Orientation Patient direction cosines are not unit length as transmitted: "
+                f"|r| = {row_norm:.12f}, |c| = {col_norm:.12f} (deviation {worst_norm_error:.3e}, "
+                f"reporting tolerance {self.COSINE_NORM_ATOL}). Within tolerance; proceeding"
+            )
 
-        x1 = 0.0
-        y1 = 0.0
-        z1 = 0.0
+        # Extract and validate Pixel Spacing for the first slice
+        pixel_spacing = self._get_tag_value(s_1, (0x0028, 0x0030))
+        if pixel_spacing is None or len(pixel_spacing) < 2:
+            # Reachable from the single-instance path, which does not run the series-wide Pixel
+            # Spacing validation, so report which way the tag fails
+            state, raw = self._tag_state(s_1, (0x0028, 0x0030), 2)
+            stored = "" if raw is None else f", stored as {raw}"
+            raise SliceGeometryError(
+                f"Pixel Spacing (0028,0030) on the first slice is {state}{stored}; "
+                f"the affine transform cannot be computed"
+            )
 
-        xn = 0.0
-        yn = 0.0
-        zn = 0.0
+        # PixelSpacing is [between rows, between columns]. Row cosine advances along column
+        # index (PixelSpacing[1]), column cosine advances along row index (PixelSpacing[0])
+        # Both cosines are used as transmitted, so each column's norm is |cosine| * spacing
+        # Also identifies non-square cases
+        row_axis_spacing, col_axis_spacing = self._pair_pixel_spacing(pixel_spacing)
 
-        ip1 = None
-        ipn = None
-        try:
-            ip1_de = s_1[0x0020, 0x0032]
-            ipn_de = s_n[0x0020, 0x0032]
-            ip1 = ip1_de.value
-            ipn = ipn_de.value
+        # Extract and validate Image Position Patient for the first slice
+        ip1 = self._get_tag_value(s_1, (0x0020, 0x0032))
+        if ip1 is None or len(ip1) < 3:
+            raise SliceGeometryError(
+                "Image Position Patient (0020,0032) is missing or malformed on the first slice; "
+                "the affine transform cannot be computed"
+            )
 
-        except KeyError:
-            pass
+        x1, y1, z1 = (float(v) for v in ip1[:3])
+        sx, sy, sz = (float(v) for v in np.asarray(step_vector, dtype=float)[:3])
 
-        x1 = ip1[0]
-        y1 = ip1[1]
-        z1 = ip1[2]
+        self._logger.debug(
+            f"Affine inputs: PixelSpacing=[{pixel_spacing[0]}, {pixel_spacing[1]}], "
+            f"IOP={self._fmt_seq(image_orientation_patient[:6], '{:.10g}')}, "
+            f"IPP(first)={self._fmt_seq(ip1[:3], '{:.6g}')}, "
+            f"step={self._fmt_seq((sx, sy, sz), '{:.9f}')}"
+        )
 
-        xn = ipn[0]
-        yn = ipn[1]
-        zn = ipn[2]
+        # DICOM affine construction
+        m1 = np.eye(4, dtype=float)
 
-        m1[0, 0] = rx * vr
-        m1[0, 1] = cx * vc
-        m1[0, 2] = (xn - x1) / (n - 1)
+        m1[0, 0] = rx * row_axis_spacing
+        m1[0, 1] = cx * col_axis_spacing
+        m1[0, 2] = sx
         m1[0, 3] = x1
 
-        m1[1, 0] = ry * vr
-        m1[1, 1] = cy * vc
-        m1[1, 2] = (yn - y1) / (n - 1)
+        m1[1, 0] = ry * row_axis_spacing
+        m1[1, 1] = cy * col_axis_spacing
+        m1[1, 2] = sy
         m1[1, 3] = y1
 
-        m1[2, 0] = rz * vr
-        m1[2, 1] = cz * vc
-        m1[2, 2] = (zn - z1) / (n - 1)
+        m1[2, 0] = rz * row_axis_spacing
+        m1[2, 1] = cz * col_axis_spacing
+        m1[2, 2] = sz
         m1[2, 3] = z1
 
-        m1[3, 0] = 0
-        m1[3, 1] = 0
-        m1[3, 2] = 0
-        m1[3, 3] = 1
+        # Every input is finite by now (_get_tag_value rejects NaN and infinity), but finite inputs
+        # can still overflow: an IPP near 1e308 differences to inf in the step vector. The
+        # invariant checks would see that only as a logged warning, so refuse it here, before
+        # either affine is stored on the series
+        if not np.all(np.isfinite(m1)):
+            raise SliceGeometryError(
+                f"The DICOM affine contains a non-finite value although every input tag was finite; "
+                f"the geometry overflowed. Inputs: PixelSpacing={list(pixel_spacing[:2])}, "
+                f"IPP(first)={list(ip1[:3])}, step={[sx, sy, sz]}\n{self._fmt_matrix(m1)}"
+            )
 
         setattr(series, self.ATTRIBUTE_DICOM_AFFINE, m1)
 
-        m2[0, 0] = -rx * vr
-        m2[0, 1] = -cx * vc
-        m2[0, 2] = -(xn - x1) / (n - 1)
+        # NIfTI affine construction
+        m2 = np.eye(4, dtype=float)
+
+        m2[0, 0] = -rx * row_axis_spacing
+        m2[0, 1] = -cx * col_axis_spacing
+        m2[0, 2] = -sx
         m2[0, 3] = -x1
 
-        m2[1, 0] = -ry * vr
-        m2[1, 1] = -cy * vc
-        m2[1, 2] = -(yn - y1) / (n - 1)
+        m2[1, 0] = -ry * row_axis_spacing
+        m2[1, 1] = -cy * col_axis_spacing
+        m2[1, 2] = -sy
         m2[1, 3] = -y1
 
-        m2[2, 0] = rz * vr
-        m2[2, 1] = cz * vc
-        m2[2, 2] = (zn - z1) / (n - 1)
+        m2[2, 0] = rz * row_axis_spacing
+        m2[2, 1] = cz * col_axis_spacing
+        m2[2, 2] = sz
         m2[2, 3] = z1
 
-        m2[3, 0] = 0
-        m2[3, 1] = 0
-        m2[3, 2] = 0
-        m2[3, 3] = 1
-
         setattr(series, self.ATTRIBUTE_NIFTI_AFFINE, m2)
+
+        self._logger.debug(f"DICOM (LPS) affine:\n{self._fmt_matrix(m1)}")
+        self._logger.debug(f"NIFTI (RAS) affine:\n{self._fmt_matrix(m2)}")
+
+        # Compare cosines stored on series with the ones derived from the affine
+        self._compare_with_stored_cosines(series, (rx, ry, rz), (cx, cy, cz))
+
+        self._logger.debug(
+            f"Affine column norms: |col0 (row cosine)|={float(np.linalg.norm(m1[:3, 0])):.9f} mm, "
+            f"|col1 (col cosine)|={float(np.linalg.norm(m1[:3, 1])):.9f} mm, "
+            f"|col2 (slice step)|={float(np.linalg.norm(m1[:3, 2])):.9f} mm"
+        )
+
+    def _compare_with_stored_cosines(self, series, row_cosine, col_cosine) -> None:
+        """Reports when direction cosines differ from the ones stored on the series.
+
+        DICOMDataLoaderOperator and DICOMSeriesToVolumeOperator both pull direction cosines
+        from ImageOrientationPatient. The former sets series.row_direction_cosine and
+        col_direction_cosine using the first instance os.listdir returns for the series, while the latter
+        constructs the affine using the first SOP instance after sorting by projection onto the slice normal.
+
+        Logs above ORIENTATION_LOG_ATOL but never raises: _validate_orientation_consistency has
+        already bounded the whole series to ORIENTATION_RAISE_ATOL, so anything seen here is
+        within a tolerance the series was already accepted under.
+        """
+        for name, attribute, used in (
+            ("row", "row_direction_cosine", np.asarray(row_cosine, dtype=float)),
+            ("column", "col_direction_cosine", np.asarray(col_cosine, dtype=float)),
+        ):
+            stored = getattr(series, attribute, None)
+            if stored is None:
+                continue
+            try:
+                stored_arr = np.asarray([float(v) for v in stored], dtype=float)
+            except (TypeError, ValueError):
+                self._logger.debug(f"series.{attribute} is not a usable triplet; comparison skipped")
+                continue
+            if stored_arr.size != 3:
+                continue
+            deviation = float(np.max(np.abs(stored_arr - used)))
+            if deviation > self.ORIENTATION_LOG_ATOL:
+                self._logger.warning(
+                    f"The {name} direction cosine stored on the series differs from the one this "
+                    f"affine was built from by {deviation:.3e} per component. The series attribute "
+                    f"comes from the first instance the loader encountered; the affine comes from "
+                    f"the first instance in sorted order. Both are within the "
+                    f"{self.ORIENTATION_RAISE_ATOL} orientation-consistency limit, so the series is "
+                    f"accepted, but any consumer reading series.{attribute} alongside this affine "
+                    f"will combine a rotation and an origin taken from different slices"
+                )
+            else:
+                self._logger.debug(
+                    f"series.{attribute} matches the affine's {name} direction to "
+                    f"{deviation:.3e} (log threshold {self.ORIENTATION_LOG_ATOL})"
+                )
+
+    def _pair_pixel_spacing(self, pixel_spacing: Sequence, log: bool = True) -> Tuple[float, float]:
+        """Decides which Pixel Spacing element scales which in-plane affine column.
+
+        Returns (row_axis_spacing, col_axis_spacing).
+
+        PS3.3 C.7.6.2 defines Pixel Spacing (0028,0030) as "adjacent row spacing \\ adjacent
+        column spacing", so PixelSpacing[0] is the spacing between adjacent rows and
+        PixelSpacing[1] the spacing between adjacent columns (further explained in PS3.3 10.7.1.3).
+        The pairing is crossed relative to those names: the row direction cosine runs along a row,
+        i.e. the direction the column index advances, so a one-column step moves by the between-columns
+        spacing PixelSpacing[1]; the column cosine runs along a column and pairs with the between-rows spacing
+        PixelSpacing[0]. This is equation C.7.6.2.1-1 of PS3.3 C.7.6.2.1.1, where the row cosine X
+        is scaled by the column pixel resolution dI = PixelSpacing[1] and the column cosine Y by
+        the row pixel resolution dJ = PixelSpacing[0].
+
+        Args:
+            pixel_spacing: The Pixel Spacing (0028,0030) value, as [between rows, between columns].
+            log (bool): Emit the pairing trace line and the non-square-pixel report. The method is
+                        pure and is called twice per series -- once to build the affine and once by
+                        verify_affine_invariants to re-derive it independently -- so the verifier
+                        passes False and the decision is reported exactly once per series.
+        """
+        spacing_between_rows = float(pixel_spacing[0])
+        spacing_between_cols = float(pixel_spacing[1])
+
+        # Row cosine pairs with between-columns spacing, column cosine with between-rows spacing
+        row_axis_spacing = spacing_between_cols
+        col_axis_spacing = spacing_between_rows
+
+        if not log:
+            return row_axis_spacing, col_axis_spacing
+
+        self._logger.debug(
+            f"Pixel Spacing (0028,0030) = [{spacing_between_rows}, {spacing_between_cols}]: "
+            f"between rows {spacing_between_rows} mm, between columns {spacing_between_cols} mm. "
+            f"Row cosine scaled by {row_axis_spacing} (between columns, PixelSpacing[1]), "
+            f"column cosine scaled by {col_axis_spacing} (between rows, PixelSpacing[0])"
+        )
+
+        if not np.isclose(
+            spacing_between_rows,
+            spacing_between_cols,
+            rtol=self.PIXEL_SPACING_LOG_RTOL,
+            atol=0.0,
+        ):
+            self._logger.info(f"Non-square pixels: PixelSpacing = [{spacing_between_rows}, {spacing_between_cols}]")
+
+        return row_axis_spacing, col_axis_spacing
+
+    def verify_affine_invariants(self, series, rtol: Optional[float] = None, raise_on_failure: bool = False) -> Dict:
+        """Re-derives the affine's geometry from the first SOP instance and checks it.
+
+        This is the assertion the test matrix should call in every case. It reads Image
+        Orientation Patient, Pixel Spacing and Image Position Patient afresh rather than reusing
+        the values compute_affine_transform worked from, so a bug in that method's bookkeeping
+        shows up as a failed check rather than being reproduced on both sides.
+
+        Checks:
+            1. |det(m[:3,:3])| == row_axis_spacing * col_axis_spacing * depth_pixel_spacing.
+               Catches a scalar/vector disagreement. Symmetric in the two in-plane spacings, so
+               it does NOT catch a transposed pairing.
+            2. n . m[:3,2] == depth_pixel_spacing. The scalar really is the projection of the
+               vector, shear included.
+            3. |m[:3,0]| == |row cosine| * the spacing paired with it. The cosine's own length is
+               included because nothing is rescaled.
+            4. |m[:3,1]| == |column cosine| * the spacing paired with it.
+               Together, 3 and 4 are the only checks that see a transposed pairing, and they only
+               see it on non-square pixels. This is what the non-square fixture exists for.
+            5. m[:3,0] and m[:3,1], normalized, equal the normalized row and column cosines.
+               Normalized on both sides because comparing a direction is scale-free; this check
+               says nothing about length, which is 3 and 4's job.
+            6. m[:3,3] == Image Position Patient of the first slice.
+            7. The NIFTI affine is the DICOM affine with rows 0 and 1 negated.
+
+        Args:
+            series: An instance of DICOMSeries with the affines already computed.
+            rtol: Relative tolerance; defaults to DETERMINANT_RTOL.
+            raise_on_failure: If True, raise SliceGeometryError listing every failed check.
+                              Default False: failures are logged, which is what the operator
+                              wants at runtime. Tests should pass True.
+
+        Returns:
+            A dict of the computed quantities plus "failures", a list of strings.
+        """
+        tol = self.DETERMINANT_RTOL if rtol is None else float(rtol)
+        failures: List[str] = []
+
+        m1 = getattr(series, self.ATTRIBUTE_DICOM_AFFINE, None)
+        m2 = getattr(series, self.ATTRIBUTE_NIFTI_AFFINE, None)
+        if m1 is None:
+            self._logger.debug("No DICOM affine on the series; invariant check skipped")
+            return {"failures": ["no dicom_affine_transform on the series"]}
+
+        s_1 = series._sop_instances[0]
+        iop = self._get_tag_value(s_1, (0x0020, 0x0037))
+        pixel_spacing = self._get_tag_value(s_1, (0x0028, 0x0030))
+        ip1 = self._get_tag_value(s_1, (0x0020, 0x0032))
+        depth = getattr(series, "depth_pixel_spacing", None)
+
+        preconditions: List[str] = []
+        if iop is None or len(iop) < 6:
+            preconditions.append("Image Orientation Patient (0020,0037) is missing or malformed on the first slice")
+        if pixel_spacing is None or len(pixel_spacing) < 2:
+            preconditions.append("Pixel Spacing (0028,0030) is missing or malformed on the first slice")
+        if ip1 is None or len(ip1) < 3:
+            preconditions.append("Image Position Patient (0020,0032) is missing or malformed on the first slice")
+        if depth is None:
+            preconditions.append("series.depth_pixel_spacing is not set")
+        if preconditions:
+            message = "Affine invariant check could not run:\n  " + "\n  ".join(preconditions)
+            if raise_on_failure:
+                raise SliceGeometryError(message)
+            self._logger.warning(message)
+            return {"failures": preconditions}
+        # The preconditions above return or raise whenever one of these is None; this only narrows the types
+        assert iop is not None and pixel_spacing is not None and ip1 is not None and depth is not None
+
+        row_cosine = np.asarray(iop[0:3], dtype=float)
+        col_cosine = np.asarray(iop[3:6], dtype=float)
+        normal = np.cross(row_cosine, col_cosine)
+        row_norm = float(np.linalg.norm(row_cosine))
+        col_norm = float(np.linalg.norm(col_cosine))
+        row_unit = row_cosine / row_norm if row_norm else row_cosine
+        col_unit = col_cosine / col_norm if col_norm else col_cosine
+
+        # log=False: compute_affine_transform has already reported the pairing for this series
+        # The verifier re-derives it independently, but reporting it twice adds no information
+        row_axis_spacing, col_axis_spacing = self._pair_pixel_spacing(pixel_spacing, log=False)
+
+        linear = np.asarray(m1)[:3, :3]
+        det = abs(float(np.linalg.det(linear)))
+        expected_det = row_axis_spacing * col_axis_spacing * float(depth)
+
+        col0, col1, col2 = linear[:, 0], linear[:, 1], linear[:, 2]
+        norm0, norm1 = float(np.linalg.norm(col0)), float(np.linalg.norm(col1))
+        projected_depth = float(np.dot(normal, col2))
+
+        def _check(name: str, actual: float, expected: float) -> None:
+            ok = bool(np.isclose(actual, expected, rtol=tol, atol=0.0))
+            rel = abs(actual - expected) / abs(expected) if expected else float("nan")
+            self._logger.debug(
+                f"Invariant {name}: {actual:.12f} vs {expected:.12f} (rel {rel:.3e}) {'OK' if ok else 'FAIL'}"
+            )
+            if not ok:
+                failures.append(f"{name}: {actual:.12f} != {expected:.12f} (relative {rel:.3e})")
+
+        _check("1 |det| == vr*vc*depth", det, expected_det)
+        _check("2 n.col2 == depth", projected_depth, float(depth))
+        _check("3 |col0| == |r| * row-cosine spacing", norm0, row_norm * row_axis_spacing)
+        _check("4 |col1| == |c| * col-cosine spacing", norm1, col_norm * col_axis_spacing)
+
+        for label, column, norm, cosine in (
+            ("5a col0 direction", col0, norm0, row_unit),
+            ("5b col1 direction", col1, norm1, col_unit),
+        ):
+            deviation = float(np.max(np.abs(column / norm - cosine))) if norm else float("inf")
+            ok = deviation <= self.ORIENTATION_LOG_ATOL
+            self._logger.debug(f"Invariant {label}: max deviation {deviation:.3e} {'OK' if ok else 'FAIL'}")
+            if not ok:
+                failures.append(f"{label}: max component deviation {deviation:.3e}")
+
+        origin_deviation = float(np.max(np.abs(np.asarray(m1)[:3, 3] - np.asarray(ip1[:3], dtype=float))))
+        self._logger.debug(f"Invariant 6 origin == IPP(first): max deviation {origin_deviation:.3e}")
+        if origin_deviation > 0.0:
+            failures.append(f"6 origin != IPP of the first slice: max deviation {origin_deviation:.3e}")
+
+        if m2 is not None:
+            expected_m2 = np.asarray(m1).copy()
+            expected_m2[0, :] *= -1.0
+            expected_m2[1, :] *= -1.0
+            nifti_deviation = float(np.max(np.abs(np.asarray(m2) - expected_m2)))
+            self._logger.debug(f"Invariant 7 NIFTI == LPS with rows 0,1 negated: max deviation {nifti_deviation:.3e}")
+            if nifti_deviation > 0.0:
+                failures.append(
+                    f"7 NIFTI affine is not the LPS affine with rows 0 and 1 negated: {nifti_deviation:.3e}"
+                )
+
+        if failures:
+            message = "Affine invariant check failed:\n  " + "\n  ".join(failures)
+            if raise_on_failure:
+                raise SliceGeometryError(message)
+            self._logger.warning(message)
+        else:
+            self._logger.debug(
+                f"All affine invariants hold to rtol {tol:.1e}: voxel volume {det:.9f} mm^3, "
+                f"in-plane {norm0:.9f} x {norm1:.9f} mm, depth {float(depth):.9f} mm"
+            )
+
+        return {
+            "determinant": det,
+            "expected_determinant": expected_det,
+            "depth_pixel_spacing": float(depth),
+            "projected_depth": projected_depth,
+            "row_axis_spacing": row_axis_spacing,
+            "col_axis_spacing": col_axis_spacing,
+            "col0_norm": norm0,
+            "col1_norm": norm1,
+            "failures": failures,
+        }
 
     def create_metadata(self, series) -> Dict:
         """Collects all relevant metadata from the DICOM Series and creates a dictionary.
