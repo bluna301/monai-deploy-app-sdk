@@ -210,7 +210,6 @@ class DICOMDataLoaderOperator(Operator):
                 if sop_instance_uid in seen_sop_uids:
                     repeated_uids.append((str(sop_instance_uid), seen_sop_uids[sop_instance_uid]))
                     continue
-                seen_sop_uids[str(sop_instance_uid)] = study_instance_uid
 
                 if study_instance_uid not in study_dict:
                     study = DICOMStudy(study_instance_uid)
@@ -228,32 +227,25 @@ class DICOMDataLoaderOperator(Operator):
                 # Prepare sop_map entry
                 series_key = (study_instance_uid, series_instance_uid)
                 sop_map.setdefault(series_key, {})
+                # Non-image files will be missing IPP; such instances are stored under the "None" key
                 ipp = sop_instance.get("ImagePositionPatient", None)
-                if ipp is not None:
-                    # Convert IPP to tuple
-                    ipp_tuple = cast(Tuple[float, float, float], tuple(float(v) for v in ipp))
-                else:
-                    # Non-image files will be missing IPP; store SOP instance under "None" key, move on to next SOP instance
-                    sop_map[series_key].setdefault(None, []).append(sop_instance)
-                    continue
-
-                sop_list = sop_map[series_key].setdefault(ipp_tuple, [])
-
-                if not sop_list:
-                    # First occurrence of this spatial position — store the SOP instance
-                    sop_list.append(sop_instance)
-                    continue
-
-                # Duplicate spatial location found
-                duplicate_records.append(
-                    (
-                        series_instance_uid,
-                        ipp_tuple,
-                        self._sop_instance_uid(sop_list[0]),
-                        self._sop_instance_uid(sop_instance),
+                ipp_key = None if ipp is None else cast(Tuple[float, float, float], tuple(float(v) for v in ipp))
+                sop_list = sop_map[series_key].setdefault(ipp_key, [])
+                if ipp_key is not None and sop_list:
+                    # Duplicate spatial location found; reported, and the instance is kept
+                    duplicate_records.append(
+                        (
+                            series_instance_uid,
+                            ipp_key,
+                            self._sop_instance_uid(sop_list[0]),
+                            self._sop_instance_uid(sop_instance),
+                        )
                     )
-                )
                 sop_list.append(sop_instance)
+
+                # Record the UID only once the instance is retained, so a file that fails above
+                # does not cause a later valid copy of the same instance to be skipped as a repeat
+                seen_sop_uids[str(sop_instance_uid)] = study_instance_uid
 
             except Exception as ex:
                 self._logger.warning(f"Error parsing SOP Instance: {ex}")

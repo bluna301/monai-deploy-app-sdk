@@ -167,7 +167,7 @@ class DICOMSeriesToVolumeOperator(Operator):
     # Logging Helpers
     # ------------------------------------------------------------------ #
     @classmethod
-    def _fmt_seq(cls, values: Union[Sequence, np.ndarray], fmt: str = "{:.4f}") -> str:
+    def _fmt_seq(cls, values: Sequence | np.ndarray, fmt: str = "{:.4f}") -> str:
         """Formats a sequence for logging, eliding the middle if it is long."""
         try:
             items = [fmt.format(float(v)) for v in values]
@@ -177,6 +177,29 @@ class DICOMSeriesToVolumeOperator(Operator):
         if len(items) <= 2 * n:
             return "[" + ", ".join(items) + "]"
         return "[" + ", ".join(items[:n]) + f", ... ({len(items) - 2 * n} more) ..., " + ", ".join(items[-n:]) + "]"
+
+    @staticmethod
+    def _first_absent_numbers(numbers: List[int], limit: int) -> List[int]:
+        """Returns up to `limit` of the integers missing between min(numbers) and max(numbers), lowest first.
+
+        Walks the gaps between the sorted values rather than enumerating the whole range: the
+        range is bounded only by the values in the headers, not by the number of instances loaded.
+        """
+        absent: List[int] = []
+        ordered = sorted(numbers)
+        for low, high in zip(ordered, ordered[1:]):
+            absent.extend(range(low + 1, min(high, low + 1 + limit - len(absent))))
+            if len(absent) >= limit:
+                break
+        return absent
+
+    @staticmethod
+    def _fmt_absent_numbers(absent: List[int], absent_count: int) -> str:
+        """Formats absent Instance Numbers, naming how many were not listed."""
+        listed = ", ".join(str(n) for n in absent)
+        if absent_count > len(absent):
+            return f"{absent_count} in total, the first {len(absent)}: [{listed}, ...]"
+        return f"[{listed}]"
 
     @staticmethod
     def _fmt_matrix(matrix: np.ndarray) -> str:
@@ -226,16 +249,7 @@ class DICOMSeriesToVolumeOperator(Operator):
             selection_metadata = {"selection_name": selection_name}
             metadata.update(selection_metadata)
 
-            # The affine transform and the coordinate space are set based on the flag affine_lps_to_ras.
-            # If the flag is true, the NIFTI affine (RAS) is used, otherwise the DICOM affine (LPS) is used.
-            if self.affine_lps_to_ras:
-                if hasattr(dicom_series, self.ATTRIBUTE_NIFTI_AFFINE):
-                    metadata["affine"] = getattr(dicom_series, self.ATTRIBUTE_NIFTI_AFFINE)
-                metadata.update(self.METADATA_SPACE_RAS)
-            else:
-                if hasattr(dicom_series, self.ATTRIBUTE_DICOM_AFFINE):
-                    metadata["affine"] = getattr(dicom_series, self.ATTRIBUTE_DICOM_AFFINE)
-                metadata.update(self.METADATA_SPACE_LPS)
+            self._add_affine_metadata(metadata, dicom_series)
 
             voxel_data = self.generate_voxel_data(dicom_series)
 
@@ -260,6 +274,20 @@ class DICOMSeriesToVolumeOperator(Operator):
 
         # TODO: This needs to be updated once allowed to output multiple Image objects
         return study_selected_series_list[0].selected_series[0].image
+
+    def _add_affine_metadata(self, metadata: Dict, dicom_series) -> None:
+        """Sets the affine and coordinate space in metadata based on the flag affine_lps_to_ras.
+
+        If the flag is true, the NIFTI affine (RAS) is used, otherwise the DICOM affine (LPS) is used.
+        A series without an affine (e.g. single-instance CR) gets the space key only.
+        """
+        if self.affine_lps_to_ras:
+            attribute, space = self.ATTRIBUTE_NIFTI_AFFINE, self.METADATA_SPACE_RAS
+        else:
+            attribute, space = self.ATTRIBUTE_DICOM_AFFINE, self.METADATA_SPACE_LPS
+        if hasattr(dicom_series, attribute):
+            metadata["affine"] = getattr(dicom_series, attribute)
+        metadata.update(space)
 
     def generate_voxel_data(self, series):
         """Applies rescale slope and rescale intercept to the pixels.
@@ -292,13 +320,15 @@ class DICOMSeriesToVolumeOperator(Operator):
             # plane that reaches inference without error. A zero-length value fails inside
             # apply_rescale as a generic error. Checked outside the try so the error is not rewrapped
             # as a generic rescale failure. Checked only when pydicom will apply the rescale: both
-            # tags present and no Modality LUT Sequence (0028,3000), which takes precedence. Absent is
-            # fine: apply_rescale then uses the Modality LUT, or leaves the stored values unchanged.
-            # A present Modality LUT Sequence reads as "empty" or "unparsable", never "absent"
+            # tags present and no usable Modality LUT Sequence (0028,3000). pydicom selects the LUT
+            # with ds.get("ModalityLUTSequence"), so only a non-empty sequence takes precedence; an
+            # absent or zero-item sequence falls through to the rescale tags. Absent rescale tags
+            # are fine: apply_rescale then uses the Modality LUT, or leaves the stored values unchanged
             rescale_tags = (((0x0028, 0x1053), "Rescale Slope"), ((0x0028, 0x1052), "Rescale Intercept"))
             rescale_states = [(tag, keyword, *self._tag_state(sop_instance, tag, 1)) for tag, keyword in rescale_tags]
             modality_lut_state, _ = self._tag_state(sop_instance, (0x0028, 0x3000), 1)
-            if modality_lut_state == "absent" and all(state != "absent" for _, _, state, _ in rescale_states):
+            rescale_applies = all(state != "absent" for _, _, state, _ in rescale_states)
+            if modality_lut_state in ("absent", "empty") and rescale_applies:
                 for tag, keyword, state, raw in rescale_states:
                     if state in ("empty", "unparsable", "non-finite"):
                         raise ValueError(
@@ -549,6 +579,52 @@ class DICOMSeriesToVolumeOperator(Operator):
                 f"exactly parallel"
             )
 
+    @staticmethod
+    def _pixel_spacing_unusable(ps: Optional[list]) -> bool:
+        """True when Pixel Spacing cannot scale an affine column.
+
+        Absent, short, non-finite and non-positive all qualify. A zero or NaN element has
+        to be caught here rather than by the relative comparison in
+        _validate_pixel_spacing_consistency: that comparison divides by the reference, so an
+        all-zero series yields 0/0 = nan, and max(0.0, nan) returns 0.0 in Python -- the series
+        passes silently and the affine comes out singular, with only invariants 5a/5b noticing
+        and only as a warning.
+        """
+        if ps is None or len(ps) < 2:
+            return True
+        values = np.asarray(ps[:2], dtype=float)
+        return bool(not np.all(np.isfinite(values)) or np.any(values <= 0.0))
+
+    def _reject_unusable_pixel_spacing(self, ps_list: List[Optional[list]], sop_instances) -> None:
+        """Raises if any instance's Pixel Spacing (0028,0030) cannot scale the affine."""
+        missing = [i for i, ps in enumerate(ps_list) if self._pixel_spacing_unusable(ps)]
+        if not missing:
+            return
+
+        def _reason(i: int) -> str:
+            ps = ps_list[i]
+            if ps is not None and len(ps) >= 2:
+                return f"non-positive {ps[:2]}"
+            state, raw = self._tag_state(sop_instances[i], (0x0028, 0x0030), 2)
+            return state if raw is None else f"{state}, stored as {raw}"
+
+        shown = missing[: self.DUPLICATE_REPORT_LIMIT]
+        detail = "\n".join(
+            f"  array index {i}: Pixel Spacing {_reason(i)}, "
+            f"SOP Instance UID {self._sop_uid(sop_instances[i])}, "
+            f"Instance Number {self._instance_number(sop_instances[i])}"
+            for i in shown
+        )
+        if len(missing) > len(shown):
+            detail += f"\n  ... and {len(missing) - len(shown)} more"
+        raise SliceGeometryError(
+            f"Pixel Spacing (0028,0030) is absent, malformed, or not a pair of positive "
+            f"finite numbers on {len(missing)} of {len(ps_list)} instance(s) that carry "
+            f"orientation and position. The affine scales its in-plane axes by this value, so "
+            f"it cannot be built. The series may be malformed or combine more than one "
+            f"acquisition\n{detail}"
+        )
+
     def _validate_pixel_spacing_consistency(self, ps_list: List[Optional[list]], sop_instances) -> None:
         """Every SOP instance must declare the same in-plane Pixel Spacing (0028,0030).
 
@@ -556,47 +632,7 @@ class DICOMSeriesToVolumeOperator(Operator):
         slice whose in-plane spacing differs would be scaled wrongly.
         """
 
-        def _unusable(ps: Optional[list]) -> bool:
-            """True when Pixel Spacing cannot scale an affine column.
-
-            Absent, short, non-finite and non-positive all qualify. A zero or NaN element has
-            to be caught here rather than by the relative comparison below: that comparison
-            divides by the reference, so an all-zero series yields 0/0 = nan, and max(0.0, nan)
-            returns 0.0 in Python -- the series passes silently and the affine comes out
-            singular, with only invariants 5a/5b noticing and only as a warning.
-            """
-            if ps is None or len(ps) < 2:
-                return True
-            values = np.asarray(ps[:2], dtype=float)
-            return bool(not np.all(np.isfinite(values)) or np.any(values <= 0.0))
-
-        missing = [i for i, ps in enumerate(ps_list) if _unusable(ps)]
-
-        if missing:
-            shown = missing[: self.DUPLICATE_REPORT_LIMIT]
-
-            def _reason(i: int) -> str:
-                ps = ps_list[i]
-                if ps is not None and len(ps) >= 2:
-                    return f"non-positive {ps[:2]}"
-                state, raw = self._tag_state(sop_instances[i], (0x0028, 0x0030), 2)
-                return state if raw is None else f"{state}, stored as {raw}"
-
-            detail = "\n".join(
-                f"  array index {i}: Pixel Spacing {_reason(i)}, "
-                f"SOP Instance UID {self._sop_uid(sop_instances[i])}, "
-                f"Instance Number {self._instance_number(sop_instances[i])}"
-                for i in shown
-            )
-            if len(missing) > len(shown):
-                detail += f"\n  ... and {len(missing) - len(shown)} more"
-            raise SliceGeometryError(
-                f"Pixel Spacing (0028,0030) is absent, malformed, or not a pair of positive "
-                f"finite numbers on {len(missing)} of {len(ps_list)} instance(s) that carry "
-                f"orientation and position. The affine scales its in-plane axes by this value, so "
-                f"it cannot be built. The series may be malformed or combine more than one "
-                f"acquisition\n{detail}"
-            )
+        self._reject_unusable_pixel_spacing(ps_list, sop_instances)
 
         # Every entry is present here: the check above raised on any absent Pixel Spacing, so this
         # keeps the array indices of ps_list and only narrows the type
@@ -688,7 +724,8 @@ class DICOMSeriesToVolumeOperator(Operator):
         so a gap in the numbering is not sufficient evidence of a loss.
 
         Returns the Instance Numbers that fall inside the observed range but were not loaded, so
-        that _report_spacing can name them when it accepts or refuses a deficient series. Empty
+        that _report_spacing can name them when it accepts or refuses a deficient series. At most
+        2 x TRACE_HEAD_TAIL are listed, lowest first; the warning logged here gives the total. Empty
         when the numbering is continuous; None when it cannot say, because the tag is absent,
         unusable or repeated, or missing from some instances. Note that instances missing from the
         start or end of a series are invisible here and to every other check in this operator.
@@ -732,12 +769,13 @@ class DICOMSeriesToVolumeOperator(Operator):
         if expected == len(numbers):
             return []
 
-        absent = sorted(set(range(min(numbers), max(numbers) + 1)) - set(numbers))
+        absent_count = expected - len(numbers)
+        absent = self._first_absent_numbers(numbers, 2 * self.TRACE_HEAD_TAIL)
         self._logger.warning(
             f"Instance Number (0020,0013) ranges from {min(numbers)} to {max(numbers)}, "
             f"implying {expected} instances, but {len(sop_instances)} were loaded. "
             f"Instances may be missing from the series as delivered. "
-            f"Absent instance numbers: {self._fmt_seq(absent, '{:.0f}')}"
+            f"Absent instance numbers: {self._fmt_absent_numbers(absent, absent_count)}"
         )
         return absent
 
@@ -1180,7 +1218,7 @@ class DICOMSeriesToVolumeOperator(Operator):
         grid_indices = np.round(offsets / spacing)
         grid_residuals = np.abs(offsets - grid_indices * spacing)
         max_grid_residual = float(grid_residuals.max())
-        if max_grid_residual == 0.0:
+        if max_grid_residual <= 0.0:  # residuals are absolute values, so this means exactly on the grid
             self._logger.debug(
                 f"Grid residual: all slices lie on the grid (residual 0); "
                 f"tolerance {self.grid_residual_rtol} x {spacing:.6f} = "
@@ -1266,7 +1304,7 @@ class DICOMSeriesToVolumeOperator(Operator):
             1. irregular spacing - no single base spacing describes the series
             2. grid residual - the positions drift off the grid cumulatively
             3. uniform with interior gaps - interior instances are absent from an otherwise uniform grid
-            4. uniform
+            4. uniform - accepted if every slice origin lies on the affine's lattice (_check_step_model)
 
         Logs the following diagnostics:
             slice_spacing_regularity: one of uniform | uniform_with_interior_gaps | irregular
@@ -1312,7 +1350,7 @@ class DICOMSeriesToVolumeOperator(Operator):
             )
         elif absent_numbers:
             corroboration = (
-                f"\nInstance Numbers absent from the series as delivered: "
+                f"\nInstance Numbers absent from the series as delivered include "
                 f"{self._fmt_seq(absent_numbers, '{:.0f}')}. May be consistent with instances dropped "
                 f"in transit rather than a non-uniform acquisition, though not proof of it: Instance "
                 f"Numbers are not required to be contiguous."
@@ -1350,13 +1388,43 @@ class DICOMSeriesToVolumeOperator(Operator):
                 f"({geometry['expected_slice_count']} grid positions).\n{detail}{corroboration}\n"
             )
 
-        # Uniform spacing
-        if regularity == self.SPACING_UNIFORM:
-            self._logger.debug(
-                f"Slice spacing is uniform: {spacing:.6f} mm across {positions.size} slices "
-                f"(worst grid residual {residual:.6f} mm)"
+        # Uniform spacing: the only classification left. The grid residual above tests positions
+        # along the normal only; the affine also places each origin in-plane, so check that too
+        self._check_step_model(geometry["ipp_sorted"], geometry["step_vector"], residual_limit)
+        self._logger.debug(
+            f"Slice spacing is uniform: {spacing:.6f} mm across {positions.size} slices "
+            f"(worst grid residual {residual:.6f} mm)"
+        )
+
+    def _check_step_model(self, ipp_sorted: List[np.ndarray], step_vector: np.ndarray, limit: float) -> None:
+        """Refuses a uniform series whose slice origins do not lie on the affine's lattice.
+
+        The affine places slice k at IPP(first) + k x step_vector. The grid residual check sees
+        only each origin's projection onto the slice normal, so an origin displaced within its
+        plane passes it: IPPs (0,0,0), (10,0,4), (0,0,8) project to a uniform 4 mm, the averaged
+        step is (0,0,4), and the middle plane would sit 10 mm from where the header puts it. A
+        constant in-plane shear (gantry tilt) is part of step_vector and leaves no residual.
+        Uses the same limit as the grid residual check, grid_residual_rtol x the base spacing.
+        """
+        origins = np.stack(ipp_sorted, axis=0)
+        modelled = origins[0] + np.arange(origins.shape[0])[:, None] * step_vector
+        residuals = np.linalg.norm(origins - modelled, axis=1)
+        worst_index = int(np.argmax(residuals))
+        worst = float(residuals[worst_index])
+        self._logger.debug(
+            f"Step model check: worst slice origin is array index {worst_index}, {worst:.6f} mm from "
+            f"IPP(first) + index x step {self._fmt_seq(step_vector, '{:.6f}')}; limit {limit:.6f} mm"
+        )
+        if worst > limit:
+            raise SliceGeometryError(
+                f"Slice origins do not lie on a single straight lattice: array index {worst_index} sits "
+                f"{worst:.6f} mm from IPP(first) + {worst_index} x the mean step "
+                f"{self._fmt_seq(step_vector, '{:.6f}')} mm, above the limit of {limit:.6f} mm "
+                f"({self.grid_residual_rtol} x the base spacing). The spacing along the normal is "
+                f"uniform, so the displacement lies within the slice planes: the affine would place "
+                f"that plane away from its stated position. The series may combine acquisitions with "
+                f"different fields of view or table positions"
             )
-            return
 
     def prepare_series(self, series) -> None:
         """Orders the slices of a series and derives its depth pixel spacing and affine transforms.
@@ -1556,10 +1624,12 @@ class DICOMSeriesToVolumeOperator(Operator):
 
         # Extract and validate Pixel Spacing for the first slice
         pixel_spacing = self._get_tag_value(s_1, (0x0028, 0x0030))
-        if pixel_spacing is None or len(pixel_spacing) < 2:
+        if pixel_spacing is None or self._pixel_spacing_unusable(pixel_spacing):
             # Reachable from the single-instance path, which does not run the series-wide Pixel
-            # Spacing validation, so report which way the tag fails
+            # Spacing validation, so report which way the tag fails. A zero or negative element
+            # parses cleanly ("ok") but would make the affine singular
             state, raw = self._tag_state(s_1, (0x0028, 0x0030), 2)
+            state = "non-positive" if state == "ok" else state
             stored = "" if raw is None else f", stored as {raw}"
             raise SliceGeometryError(
                 f"Pixel Spacing (0028,0030) on the first slice is {state}{stored}; "
